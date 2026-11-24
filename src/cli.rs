@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::catalog::{OS_CATALOG, OsPreset, find_preset, is_preset_downloaded, preset_iso_path};
 use crate::config::{
-    CreateVmRequest, DiskIoMode, HostSpecs, VmConfig, VmStore, format_bytes, format_memory_mb,
+    CreateVmRequest, DiskIoMode, DisplayScale, HostSpecs, VmConfig, VmStore, format_bytes,
+    format_memory_mb,
 };
 use crate::disk;
 use crate::download;
@@ -163,7 +164,10 @@ pub enum Commands {
         /// Enable or disable SPICE clipboard sharing
         #[arg(long)]
         clipboard: Option<bool>,
-        /// Enable or disable HiDPI 2x Retina display (false = Smooth 1x, 4x faster GUI)
+        /// Display scaling quality: 1x (Smooth), 1.5x (Crisp fullscreen default), or 2x (Native Retina)
+        #[arg(long)]
+        scale: Option<String>,
+        /// Legacy alias: true = 2x Retina, false = 1x Smooth
         #[arg(long)]
         hidpi: Option<bool>,
         /// Disk I/O mode: fastest (Cached+Fsync), low-ram (Uncached+Fsync), or strict (Full Sync)
@@ -401,6 +405,7 @@ pub fn run(cli: Cli) -> Result<()> {
             audio,
             mic,
             clipboard,
+            scale,
             hidpi,
             disk_mode,
             auto_reclaim,
@@ -441,7 +446,22 @@ pub fn run(cli: Cli) -> Result<()> {
             if let Some(c) = clipboard {
                 cfg.enable_clipboard = c;
             }
-            if let Some(h) = hidpi {
+            if let Some(sc) = scale {
+                let parsed = match sc.trim().to_lowercase().as_str() {
+                    "1x" | "1" | "smooth" => DisplayScale::Smooth1x,
+                    "1.5x" | "1.5" | "crisp" => DisplayScale::Crisp15x,
+                    "2x" | "2" | "retina" | "hidpi" => DisplayScale::Retina2x,
+                    other => bail!("Invalid --scale '{other}'. Expected: 1x, 1.5x, or 2x"),
+                };
+                cfg.display_scale = Some(parsed);
+                cfg.hidpi_display = parsed == DisplayScale::Retina2x;
+            } else if let Some(h) = hidpi {
+                let parsed = if h {
+                    DisplayScale::Retina2x
+                } else {
+                    DisplayScale::Smooth1x
+                };
+                cfg.display_scale = Some(parsed);
                 cfg.hidpi_display = h;
             }
             if let Some(dm) = disk_mode {
@@ -646,7 +666,7 @@ fn cmd_info(store: &VmStore, cfg: &VmConfig) -> Result<()> {
         "Display         : {}x{} Virtio-GPU ({})",
         cfg.display_width,
         cfg.display_height,
-        if cfg.hidpi_display { "HiDPI 2x" } else { "Smooth 1x" }
+        cfg.effective_display_scale().label()
     );
     println!("Disk I/O Mode   : {}", cfg.disk_io_mode.label());
     println!("Network         : NAT (MAC {})", cfg.mac_address);

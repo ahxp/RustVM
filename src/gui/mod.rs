@@ -201,6 +201,19 @@ fn setup_menu_bar(mtm: MainThreadMarker, mgr: &Rc<ManagerApp>, targets: &mut Tar
     }
     edit_item.setSubmenu(Some(&edit_menu));
 
+    // 4. View Menu (Toggle Fullscreen)
+    let view_item = NSMenuItem::new(mtm);
+    main_menu.addItem(&view_item);
+    let view_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("View"));
+    unsafe {
+        view_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Enter / Exit Fullscreen"),
+            Some(sel!(toggleFullScreen:)),
+            &NSString::from_str("f"),
+        );
+    }
+    view_item.setSubmenu(Some(&view_menu));
+
     let app = NSApplication::sharedApplication(mtm);
     app.setMainMenu(Some(&main_menu));
 }

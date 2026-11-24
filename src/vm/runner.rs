@@ -459,10 +459,11 @@ impl VmRunner {
         Ok(())
     }
 
-    /// Dynamically reconfigures the Virtio-GPU scanout resolution in pixels (used for Smooth 1x mode).
+    /// Dynamically reconfigures the Virtio-GPU scanout resolution in pixels.
+    /// Uses 2-pixel alignment (preserving exact fullscreen aspect ratio with zero black bars).
     pub fn reconfigure_display(&self, width: usize, height: usize) {
-        let w = ((width / 8) * 8).clamp(800, 3840) as f64;
-        let h = ((height / 8) * 8).clamp(600, 2160) as f64;
+        let w = (width & !1).clamp(800, 4096) as f64;
+        let h = (height & !1).clamp(600, 2560) as f64;
         unsafe {
             let gpus = self.vm.graphicsDevices();
             if gpus.is_empty() {
@@ -474,7 +475,7 @@ impl VmRunner {
             }
             let display = displays.objectAtIndex(0);
             let current = display.sizeInPixels();
-            if (current.width - w).abs() < 4.0 && (current.height - h).abs() < 4.0 {
+            if (current.width - w).abs() < 2.0 && (current.height - h).abs() < 2.0 {
                 return;
             }
             let _ = display.reconfigureWithSizeInPixels_error(CGSize::new(w, h));

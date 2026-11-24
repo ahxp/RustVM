@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::catalog::{OS_CATALOG, OsPreset, is_preset_downloaded, preset_iso_path};
-use crate::config::{CreateVmRequest, DiskIoMode, HostSpecs, VmConfig, VmStore, format_memory_mb};
+use crate::config::{
+    CreateVmRequest, DiskIoMode, DisplayScale, HostSpecs, VmConfig, VmStore, format_memory_mb,
+};
 use crate::disk;
 use crate::gui::widgets::{
     self, FlippedView, TargetStore, pick_directory, pick_iso_file, rect, show_error_alert,
@@ -51,7 +53,7 @@ impl VmWizardWindow {
 
         let is_edit = matches!(mode, WizardMode::Edit(_));
         let w = 576.0;
-        let h = if is_edit { 630.0 } else { 676.0 };
+        let h = if is_edit { 640.0 } else { 686.0 };
 
         let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
         let window = unsafe {
@@ -91,7 +93,7 @@ impl VmWizardWindow {
             init_nested,
             init_disk_mode,
             init_auto_reclaim,
-            init_hidpi,
+            init_scale,
             editing_cfg,
         ) = match mode {
             WizardMode::Create {
@@ -127,7 +129,7 @@ impl VmWizardWindow {
                     false,
                     DiskIoMode::Fastest,
                     true,
-                    false,
+                    DisplayScale::Crisp15x,
                     None,
                 )
             }
@@ -137,6 +139,7 @@ impl VmWizardWindow {
                     .as_deref()
                     .and_then(|id| OS_CATALOG.iter().position(|p| p.id == id))
                     .unwrap_or(OS_CATALOG.len());
+                let eff_scale = cfg.effective_display_scale();
                 (
                     cfg.name.clone(),
                     idx,
@@ -152,7 +155,7 @@ impl VmWizardWindow {
                     cfg.enable_nested_virt,
                     cfg.disk_io_mode,
                     cfg.auto_reclaim_ram,
-                    cfg.hidpi_display,
+                    eff_scale,
                     Some(cfg),
                 )
             }
@@ -170,7 +173,7 @@ impl VmWizardWindow {
         let nested_val = Rc::new(Cell::new(init_nested));
         let disk_mode_val = Rc::new(Cell::new(init_disk_mode));
         let auto_reclaim_val = Rc::new(Cell::new(init_auto_reclaim));
-        let hidpi_val = Rc::new(Cell::new(init_hidpi));
+        let scale_val = Rc::new(Cell::new(init_scale));
         let start_now_val = Rc::new(Cell::new(true));
         let preset_idx_val = Rc::new(Cell::new(init_preset_idx));
 
@@ -448,6 +451,27 @@ impl VmWizardWindow {
         }
         y += 34.0;
 
+        // 5b. Display Scale dropdown
+        root.addSubview(&widgets::semibold_label(mtm, rect(lbl_x, y + 4.0, 120.0, 18.0), "Display Scale:", 13.0));
+        {
+            let sv = Rc::clone(&scale_val);
+            let scale_modes = [
+                DisplayScale::Smooth1x.label(),
+                DisplayScale::Crisp15x.label(),
+                DisplayScale::Retina2x.label(),
+            ];
+            let sc_popup = widgets::popup(
+                mtm,
+                rect(ctrl_x, y, ctrl_w, 26.0),
+                &scale_modes,
+                init_scale.to_index(),
+                &mut targets,
+                move |idx| sv.set(DisplayScale::from_index(idx)),
+            );
+            root.addSubview(&sc_popup);
+        }
+        y += 34.0;
+
         // 6. Shared Host Folder
         root.addSubview(&widgets::semibold_label(mtm, rect(lbl_x, y + 3.0, 120.0, 18.0), "Shared Folder:", 13.0));
         let share_field = widgets::text_input(
@@ -508,19 +532,6 @@ impl VmWizardWindow {
                 init_auto_reclaim,
                 &mut targets,
                 move |b| arv.set(b),
-            );
-            root.addSubview(&cb);
-        }
-        y += 24.0;
-        {
-            let hv = Rc::clone(&hidpi_val);
-            let cb = widgets::checkbox(
-                mtm,
-                rect(ctrl_x, y, ctrl_w, 20.0),
-                "HiDPI 2× Retina Display (off = Smooth 1×, 4× faster GUI)",
-                init_hidpi,
-                &mut targets,
-                move |b| hv.set(b),
             );
             root.addSubview(&cb);
         }
@@ -671,7 +682,9 @@ impl VmWizardWindow {
                     cfg.enable_nested_virt = nested_val.get();
                     cfg.disk_io_mode = disk_mode_val.get();
                     cfg.auto_reclaim_ram = auto_reclaim_val.get();
-                    cfg.hidpi_display = hidpi_val.get();
+                    let sc = scale_val.get();
+                    cfg.display_scale = Some(sc);
+                    cfg.hidpi_display = sc == DisplayScale::Retina2x;
                     // Changing hardware invalidates any previously saved snapshot
                     store.clear_saved_state(&cfg.id);
                     if let Err(e) = store.save_vm(&cfg) {
@@ -706,7 +719,9 @@ impl VmWizardWindow {
                             cfg.enable_nested_virt = nested_val.get();
                             cfg.disk_io_mode = disk_mode_val.get();
                             cfg.auto_reclaim_ram = auto_reclaim_val.get();
-                            cfg.hidpi_display = hidpi_val.get();
+                            let sc = scale_val.get();
+                            cfg.display_scale = Some(sc);
+                            cfg.hidpi_display = sc == DisplayScale::Retina2x;
                             let _ = store.save_vm(&cfg);
                             let start_now = start_now_val.get();
                             win_ok.close();

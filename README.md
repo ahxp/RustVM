@@ -18,7 +18,7 @@ A simple, fast, VirtualBox-style Linux virtual machine manager written in **100%
 - **Full Virtual Hardware & Performance Tuning**:
   - UEFI boot (`VZEFIBootLoader`) with persistent NVRAM (`nvram.bin`)
   - **Instant Suspend / Resume (`Save & Close`)**: freezes VM state to disk (`state.vzsave`) so closed VMs use **0 MB RAM / 0% CPU** and resume in ~1–2 seconds
-  - **Smooth 1× Display Mode** (1:1 crisp pixel sync on boot & resize) with live **HiDPI (2×)** toggle on the toolbar
+  - **True Edge-to-Edge Fullscreen & 3 Display Scale Modes**: hides window chrome in fullscreen and scales cleanly at **`1× Smooth`**, **`1.5× Crisp`** (default — 2.25× sharper fullscreen with smooth performance), or **`2× Retina`** (native pixel-for-pixel clarity) with exact 2px aspect-ratio alignment
   - **3 Disk I/O Modes**: **Fastest** (`Cached + Fsync`, default — 2×–5× faster random I/O), **Low-RAM** (`Uncached + Fsync`), and **Strict** (`Full Sync`), plus `Uncached` ISO reads
   - **Live `Free RAM` & Auto-Reclaim**: automatically reclaims unused Linux page cache when minimized or inactive (Virtio memory balloon pulse)
   - USB keyboard & seamless absolute mouse, automatic NAT networking, Virtio-Sound speakers (opt-in mic to avoid idle wakeups), and SPICE clipboard sharing
@@ -46,7 +46,7 @@ To also install `RustVM.app` into `~/Applications`:
 ./setup.sh --install-app
 ```
 
-To package a distributable macOS `.dmg` installer (`dist/RustVM-1.1.0-arm64.dmg`):
+To package a distributable macOS `.dmg` installer (`dist/RustVM-1.1.1-arm64.dmg`):
 
 ```bash
 ./build-dmg.sh

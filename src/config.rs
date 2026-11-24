@@ -8,6 +8,57 @@ use crate::disk;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum DisplayScale {
+    /// Exact 1x logical window size (fastest, clean 2:1 integer upscale on Retina)
+    Smooth1x,
+    /// 1.5x crisp resolution (2.25x sharper than 1x while staying smooth in fullscreen)
+    Crisp15x,
+    /// Native 2x Retina backing resolution (pixel-for-pixel sharpness, zero upscaling blur)
+    Retina2x,
+}
+
+impl Default for DisplayScale {
+    fn default() -> Self {
+        Self::Crisp15x
+    }
+}
+
+impl DisplayScale {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Smooth1x => "1× Smooth (Fastest)",
+            Self::Crisp15x => "1.5× Crisp (Balanced)",
+            Self::Retina2x => "2× Retina (Sharpest)",
+        }
+    }
+
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            Self::Smooth1x => "1× Smooth",
+            Self::Crisp15x => "1.5× Crisp",
+            Self::Retina2x => "2× Retina",
+        }
+    }
+
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Smooth1x,
+            1 => Self::Crisp15x,
+            _ => Self::Retina2x,
+        }
+    }
+
+    pub fn to_index(self) -> usize {
+        match self {
+            Self::Smooth1x => 0,
+            Self::Crisp15x => 1,
+            Self::Retina2x => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DiskIoMode {
     /// Cached in macOS unified page cache + Fsync (2-5x faster random I/O & app launches)
     Fastest,
@@ -75,6 +126,8 @@ pub struct VmConfig {
     #[serde(default)]
     pub hidpi_display: bool,
     #[serde(default)]
+    pub display_scale: Option<DisplayScale>,
+    #[serde(default)]
     pub disk_io_mode: DiskIoMode,
     #[serde(default = "default_true")]
     pub auto_reclaim_ram: bool,
@@ -98,6 +151,19 @@ pub struct VmConfig {
     pub mac_address: String,
     #[serde(default = "now_iso_string")]
     pub created_at: String,
+}
+
+impl VmConfig {
+    /// Returns the effective display scale mode (migrating legacy `hidpi_display` cleanly).
+    pub fn effective_display_scale(&self) -> DisplayScale {
+        if let Some(scale) = self.display_scale {
+            scale
+        } else if self.hidpi_display {
+            DisplayScale::Retina2x
+        } else {
+            DisplayScale::Crisp15x
+        }
+    }
 }
 
 fn default_display_width() -> usize {
@@ -377,6 +443,7 @@ impl VmStore {
             display_height: default_display_height(),
             display_ppi: default_display_ppi(),
             hidpi_display: false,
+            display_scale: Some(DisplayScale::Crisp15x),
             disk_io_mode: DiskIoMode::Fastest,
             auto_reclaim_ram: true,
             iso_path: req.iso_path,

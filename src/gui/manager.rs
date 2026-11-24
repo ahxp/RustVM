@@ -713,7 +713,7 @@ impl ManagerApp {
                 "{}×{} ({})",
                 vm.display_width,
                 vm.display_height,
-                if vm.hidpi_display { "HiDPI 2×" } else { "Smooth 1×" }
+                vm.effective_display_scale().short_label()
             ),
         );
         add_kv_row(

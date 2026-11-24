@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-use crate::config::{DiskIoMode, VmConfig, VmStore, format_memory_mb};
+use crate::config::{DiskIoMode, DisplayScale, VmConfig, VmStore, format_memory_mb};
 use crate::gui::widgets::{
     self, FlippedView, TargetStore, pick_iso_file, rect, show_error_alert, size,
 };
@@ -25,10 +25,17 @@ use crate::vm::console::SerialBridge;
 use crate::vm::runner::VmRunner;
 use crate::vm::{VmEvent, VmState};
 
+const TOOLBAR_H: f64 = 46.0;
+const FOOTER_H: f64 = 26.0;
+
 struct DisplayWindowDelegateIvars {
     on_should_close: RefCell<Box<dyn Fn() -> bool>>,
     on_will_close: RefCell<Box<dyn Fn()>>,
     on_resize: RefCell<Box<dyn Fn()>>,
+    on_will_enter_fs: RefCell<Box<dyn Fn()>>,
+    on_did_enter_fs: RefCell<Box<dyn Fn()>>,
+    on_will_exit_fs: RefCell<Box<dyn Fn()>>,
+    on_did_exit_fs: RefCell<Box<dyn Fn()>>,
     on_minimize: RefCell<Box<dyn Fn()>>,
     on_resign_key: RefCell<Box<dyn Fn()>>,
     on_become_key: RefCell<Box<dyn Fn()>>,
@@ -58,14 +65,24 @@ define_class!(
             (self.ivars().on_resize.borrow())();
         }
 
+        #[unsafe(method(windowWillEnterFullScreen:))]
+        fn window_will_enter_full_screen(&self, _notification: &NSNotification) {
+            (self.ivars().on_will_enter_fs.borrow())();
+        }
+
         #[unsafe(method(windowDidEnterFullScreen:))]
         fn window_did_enter_full_screen(&self, _notification: &NSNotification) {
-            (self.ivars().on_resize.borrow())();
+            (self.ivars().on_did_enter_fs.borrow())();
+        }
+
+        #[unsafe(method(windowWillExitFullScreen:))]
+        fn window_will_exit_full_screen(&self, _notification: &NSNotification) {
+            (self.ivars().on_will_exit_fs.borrow())();
         }
 
         #[unsafe(method(windowDidExitFullScreen:))]
         fn window_did_exit_full_screen(&self, _notification: &NSNotification) {
-            (self.ivars().on_resize.borrow())();
+            (self.ivars().on_did_exit_fs.borrow())();
         }
 
         #[unsafe(method(windowDidMiniaturize:))]
@@ -86,27 +103,40 @@ define_class!(
 );
 
 impl DisplayWindowDelegate {
-    fn new<F, G, H, M, R, B>(
+    #[allow(clippy::too_many_arguments)]
+    fn new<F, G, H, A, B, C, D, M, R, K>(
         mtm: MainThreadMarker,
         on_should_close: F,
         on_will_close: G,
         on_resize: H,
+        on_will_enter_fs: A,
+        on_did_enter_fs: B,
+        on_will_exit_fs: C,
+        on_did_exit_fs: D,
         on_minimize: M,
         on_resign_key: R,
-        on_become_key: B,
+        on_become_key: K,
     ) -> Retained<Self>
     where
         F: Fn() -> bool + 'static,
         G: Fn() + 'static,
         H: Fn() + 'static,
+        A: Fn() + 'static,
+        B: Fn() + 'static,
+        C: Fn() + 'static,
+        D: Fn() + 'static,
         M: Fn() + 'static,
         R: Fn() + 'static,
-        B: Fn() + 'static,
+        K: Fn() + 'static,
     {
         let this = mtm.alloc::<Self>().set_ivars(DisplayWindowDelegateIvars {
             on_should_close: RefCell::new(Box::new(on_should_close)),
             on_will_close: RefCell::new(Box::new(on_will_close)),
             on_resize: RefCell::new(Box::new(on_resize)),
+            on_will_enter_fs: RefCell::new(Box::new(on_will_enter_fs)),
+            on_did_enter_fs: RefCell::new(Box::new(on_did_enter_fs)),
+            on_will_exit_fs: RefCell::new(Box::new(on_will_exit_fs)),
+            on_did_exit_fs: RefCell::new(Box::new(on_did_exit_fs)),
             on_minimize: RefCell::new(Box::new(on_minimize)),
             on_resign_key: RefCell::new(Box::new(on_resign_key)),
             on_become_key: RefCell::new(Box::new(on_become_key)),
@@ -117,6 +147,12 @@ impl DisplayWindowDelegate {
 
 struct DisplayControls {
     window: Retained<NSWindow>,
+    root: Retained<FlippedView>,
+    toolbar: Retained<FlippedView>,
+    top_sep: Retained<NSBox>,
+    bottom_sep: Retained<NSBox>,
+    footer_bar: Retained<FlippedView>,
+    vm_view: Retained<VZVirtualMachineView>,
     status_dot: Retained<NSBox>,
     status_label: Retained<NSTextField>,
     pause_btn: Retained<NSButton>,
@@ -132,12 +168,14 @@ struct DisplayControls {
     disk_io_mode: DiskIoMode,
     can_save_state: Cell<bool>,
     shared_folder: Option<PathBuf>,
-    hidpi_mode: Cell<bool>,
+    display_scale: Cell<DisplayScale>,
+    active_pixels: Cell<(usize, usize)>,
+    in_fullscreen: Cell<bool>,
     current_iso: RefCell<Option<PathBuf>>,
     current_state: Cell<VmState>,
     log_window: RefCell<Option<Retained<NSWindow>>>,
     idle_reclaim_timer: RefCell<Option<Retained<NSTimer>>>,
-    boot_sync_timers: RefCell<Vec<Retained<NSTimer>>>,
+    sync_timers: RefCell<Vec<Retained<NSTimer>>>,
 }
 
 impl DisplayControls {
@@ -145,8 +183,28 @@ impl DisplayControls {
         if let Some(t) = self.idle_reclaim_timer.borrow_mut().take() {
             t.invalidate();
         }
-        for t in self.boot_sync_timers.borrow_mut().drain(..) {
+        for t in self.sync_timers.borrow_mut().drain(..) {
             t.invalidate();
+        }
+    }
+
+    /// Toggles edge-to-edge fullscreen layout: hides chrome so the Linux guest
+    /// fills 100% of the physical screen with exact aspect ratio and zero wasted bars.
+    fn apply_chrome_layout(&self, fullscreen: bool) {
+        self.in_fullscreen.set(fullscreen);
+        self.toolbar.setHidden(fullscreen);
+        self.top_sep.setHidden(fullscreen);
+        self.bottom_sep.setHidden(fullscreen);
+        self.footer_bar.setHidden(fullscreen);
+
+        let b = self.root.bounds();
+        if fullscreen {
+            self.vm_view
+                .setFrame(rect(0.0, 0.0, b.size.width, b.size.height));
+        } else {
+            let h = (b.size.height - TOOLBAR_H - FOOTER_H).max(200.0);
+            self.vm_view
+                .setFrame(rect(0.0, TOOLBAR_H, b.size.width, h));
         }
     }
 
@@ -199,7 +257,8 @@ impl DisplayControls {
                 self.pause_btn.setEnabled(false);
                 self.save_btn.setEnabled(false);
                 self.shutdown_btn.setEnabled(false);
-                self.stop_btn.setEnabled(!matches!(state, VmState::Saving | VmState::Restoring));
+                self.stop_btn
+                    .setEnabled(!matches!(state, VmState::Saving | VmState::Restoring));
                 self.iso_btn.setEnabled(false);
                 self.reclaim_btn.setEnabled(false);
             }
@@ -233,11 +292,8 @@ impl DisplayControls {
             .and_then(|p| p.file_name())
             .map(|n| format!("ISO: {}", n.to_string_lossy()))
             .unwrap_or_else(|| "ISO: None (Disk)".to_string());
-        let display_mode = if self.hidpi_mode.get() {
-            "HiDPI 2×"
-        } else {
-            "Smooth 1× (1:1)"
-        };
+        let (pw, ph) = self.active_pixels.get();
+        let display_desc = format!("{} ({}×{})", self.display_scale.get().short_label(), pw, ph);
         let share_desc = if self.shared_folder.is_some() {
             " · Shared: virtiofs"
         } else {
@@ -247,7 +303,7 @@ impl DisplayControls {
             "{} vCPUs · {} · {} · {} · NAT · {}{}",
             self.vm_cpus,
             format_memory_mb(self.vm_memory_mb),
-            display_mode,
+            display_desc,
             self.disk_io_mode.short_label(),
             iso_desc,
             share_desc
@@ -276,16 +332,14 @@ impl VmDisplaySession {
         F: Fn(VmState) + 'static,
         G: Fn() + 'static,
     {
-        let toolbar_h = 46.0;
-        let footer_h = 26.0;
+        let initial_scale = cfg.effective_display_scale();
 
-        // Size the window cleanly for exact 1:1 pixel mapping inside the current macOS screen
         let (max_view_w, max_view_h) = NSScreen::mainScreen(mtm)
             .map(|s| {
                 let vf = s.visibleFrame();
                 (
                     (vf.size.width - 40.0).max(960.0),
-                    (vf.size.height - toolbar_h - footer_h - 48.0).max(600.0),
+                    (vf.size.height - TOOLBAR_H - FOOTER_H - 48.0).max(600.0),
                 )
             })
             .unwrap_or((1440.0, 900.0));
@@ -293,7 +347,7 @@ impl VmDisplaySession {
         let view_w = (cfg.display_width as f64).clamp(960.0, max_view_w);
         let view_h = (cfg.display_height as f64).clamp(600.0, max_view_h);
         let width = view_w;
-        let height = view_h + toolbar_h + footer_h;
+        let height = view_h + TOOLBAR_H + FOOTER_H;
 
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
@@ -311,7 +365,9 @@ impl VmDisplaySession {
         unsafe {
             window.setReleasedWhenClosed(false);
         }
-        window.setMinSize(size(940.0, 560.0));
+        // Black background prevents gray flashes during fullscreen transitions
+        window.setBackgroundColor(Some(&NSColor::blackColor()));
+        window.setMinSize(size(960.0, 560.0));
         window.setTitle(&NSString::from_str(&format!(
             "RustVM — {} [Starting…]",
             cfg.name
@@ -324,23 +380,38 @@ impl VmDisplaySession {
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
 
-        let toolbar = FlippedView::new(mtm, rect(0.0, 0.0, width, toolbar_h));
+        let toolbar_bg = widgets::tint_card(
+            mtm,
+            rect(0.0, 0.0, width, TOOLBAR_H),
+            &NSColor::windowBackgroundColor(),
+            &NSColor::clearColor(),
+            0.0,
+        )
+        .0;
+        toolbar_bg.setBorderWidth(0.0);
+        toolbar_bg.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
+        );
+        let toolbar = FlippedView::new(mtm, rect(0.0, 0.0, width, TOOLBAR_H));
         toolbar.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
         );
+        toolbar.addSubview(&toolbar_bg);
         root.addSubview(&toolbar);
 
-        let top_sep = widgets::separator(mtm, rect(0.0, toolbar_h - 1.0, width, 1.0));
+        let top_sep = widgets::separator(mtm, rect(0.0, TOOLBAR_H - 1.0, width, 1.0));
         top_sep.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
         );
         root.addSubview(&top_sep);
 
-        let vm_view_rect = rect(0.0, toolbar_h, width, height - toolbar_h - footer_h);
+        // We control scanout resolution explicitly for all 3 modes (1x Smooth, 1.5x Crisp, 2x Retina)
+        // so both windowed and edge-to-edge fullscreen always maintain exact aspect ratio & crispness.
+        let vm_view_rect = rect(0.0, TOOLBAR_H, width, height - TOOLBAR_H - FOOTER_H);
         let vm_view = unsafe {
             let v = VZVirtualMachineView::initWithFrame(mtm.alloc(), vm_view_rect);
             v.setCapturesSystemKeys(true);
-            v.setAutomaticallyReconfiguresDisplay(cfg.hidpi_display);
+            v.setAutomaticallyReconfiguresDisplay(false);
             v
         };
         vm_view.setAutoresizingMask(
@@ -349,22 +420,39 @@ impl VmDisplaySession {
         );
         root.addSubview(&vm_view);
 
-        let bottom_sep = widgets::separator(mtm, rect(0.0, height - footer_h, width, 1.0));
+        let bottom_sep = widgets::separator(mtm, rect(0.0, height - FOOTER_H, width, 1.0));
         bottom_sep.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
         );
         root.addSubview(&bottom_sep);
 
+        let footer_bar = FlippedView::new(mtm, rect(0.0, height - FOOTER_H, width, FOOTER_H));
+        footer_bar.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+        let footer_bg = widgets::tint_card(
+            mtm,
+            rect(0.0, 0.0, width, FOOTER_H),
+            &NSColor::windowBackgroundColor(),
+            &NSColor::clearColor(),
+            0.0,
+        )
+        .0;
+        footer_bg.setBorderWidth(0.0);
+        footer_bg.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        footer_bar.addSubview(&footer_bg);
+
         let footer_label = widgets::secondary_label(
             mtm,
-            rect(12.0, height - footer_h + 4.0, width - 24.0, 18.0),
+            rect(12.0, 4.0, width - 24.0, 18.0),
             "",
             11.0,
         );
-        footer_label.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
-        );
-        root.addSubview(&footer_label);
+        footer_label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+        footer_bar.addSubview(&footer_label);
+        root.addSubview(&footer_bar);
 
         let mut targets = TargetStore::new();
 
@@ -373,30 +461,30 @@ impl VmDisplaySession {
         toolbar.addSubview(&status_dot);
 
         let status_label =
-            widgets::semibold_label(mtm, rect(28.0, 14.0, 72.0, 18.0), "Starting…", 12.0);
+            widgets::semibold_label(mtm, rect(26.0, 14.0, 68.0, 18.0), "Starting…", 11.5);
         toolbar.addSubview(&status_label);
 
         let pause_btn =
-            widgets::push_button(mtm, rect(102.0, 9.0, 66.0, 28.0), "Pause", &mut targets, || {});
+            widgets::push_button(mtm, rect(96.0, 9.0, 62.0, 28.0), "Pause", &mut targets, || {});
         let save_btn = widgets::push_button(
             mtm,
-            rect(172.0, 9.0, 94.0, 28.0),
+            rect(162.0, 9.0, 92.0, 28.0),
             "Save & Close",
             &mut targets,
             || {},
         );
         let shutdown_btn = widgets::push_button(
             mtm,
-            rect(270.0, 9.0, 80.0, 28.0),
+            rect(258.0, 9.0, 76.0, 28.0),
             "Shutdown",
             &mut targets,
             || {},
         );
         let stop_btn =
-            widgets::push_button(mtm, rect(354.0, 9.0, 56.0, 28.0), "Stop", &mut targets, || {});
+            widgets::push_button(mtm, rect(338.0, 9.0, 52.0, 28.0), "Stop", &mut targets, || {});
         let iso_btn = widgets::push_button(
             mtm,
-            rect(416.0, 9.0, 90.0, 28.0),
+            rect(394.0, 9.0, 86.0, 28.0),
             if cfg.iso_path.is_some() {
                 "Eject ISO"
             } else {
@@ -407,32 +495,49 @@ impl VmDisplaySession {
         );
         let reclaim_btn = widgets::push_button(
             mtm,
-            rect(510.0, 9.0, 80.0, 28.0),
+            rect(484.0, 9.0, 76.0, 28.0),
             "Free RAM",
             &mut targets,
             || {},
         );
-        let log_btn = widgets::push_button(
-            mtm,
-            rect(594.0, 9.0, 74.0, 28.0),
-            "Serial Log",
-            &mut targets,
-            || {},
-        );
+        let log_btn =
+            widgets::push_button(mtm, rect(564.0, 9.0, 52.0, 28.0), "Log", &mut targets, || {});
 
-        let hidpi_cb = widgets::checkbox(
+        let scale_items = [
+            DisplayScale::Smooth1x.short_label(),
+            DisplayScale::Crisp15x.short_label(),
+            DisplayScale::Retina2x.short_label(),
+        ];
+        let scale_popup = widgets::popup(
             mtm,
-            rect(678.0, 13.0, 88.0, 20.0),
-            "HiDPI (2×)",
-            cfg.hidpi_display,
+            rect(622.0, 10.0, 108.0, 26.0),
+            &scale_items,
+            initial_scale.to_index(),
             &mut targets,
             |_| {},
         );
+        scale_popup.setToolTip(Some(&NSString::from_str(
+            "Display quality: 1× Smooth (fastest), 1.5× Crisp (sharp fullscreen), 2× Retina (native Liquid Retina clarity)",
+        )));
+
+        let win_for_fs = window.clone();
+        let fs_btn = widgets::push_button(
+            mtm,
+            rect(734.0, 9.0, 90.0, 28.0),
+            "⛶ Fullscreen",
+            &mut targets,
+            move || {
+                win_for_fs.toggleFullScreen(None);
+            },
+        );
+        fs_btn.setToolTip(Some(&NSString::from_str(
+            "Enter edge-to-edge fullscreen (hides toolbar and scales Linux cleanly to fill screen)",
+        )));
 
         let vm_view_for_keys = vm_view.clone();
         let keys_cb = widgets::checkbox(
             mtm,
-            rect(770.0, 13.0, 114.0, 20.0),
+            rect(832.0, 13.0, 108.0, 20.0),
             "Capture Keys",
             true,
             &mut targets,
@@ -448,7 +553,8 @@ impl VmDisplaySession {
         toolbar.addSubview(&iso_btn);
         toolbar.addSubview(&reclaim_btn);
         toolbar.addSubview(&log_btn);
-        toolbar.addSubview(&hidpi_cb);
+        toolbar.addSubview(&scale_popup);
+        toolbar.addSubview(&fs_btn);
         toolbar.addSubview(&keys_cb);
 
         window.setContentView(Some(&root));
@@ -459,6 +565,12 @@ impl VmDisplaySession {
 
         let controls = Rc::new(DisplayControls {
             window: window.clone(),
+            root: root.clone(),
+            toolbar: toolbar.clone(),
+            top_sep: top_sep.clone(),
+            bottom_sep: bottom_sep.clone(),
+            footer_bar: footer_bar.clone(),
+            vm_view: vm_view.clone(),
             status_dot,
             status_label,
             pause_btn: pause_btn.clone(),
@@ -474,12 +586,14 @@ impl VmDisplaySession {
             disk_io_mode: cfg.disk_io_mode,
             can_save_state: Cell::new(false),
             shared_folder: cfg.shared_folder.clone(),
-            hidpi_mode: Cell::new(cfg.hidpi_display),
+            display_scale: Cell::new(initial_scale),
+            active_pixels: Cell::new((cfg.display_width, cfg.display_height)),
+            in_fullscreen: Cell::new(false),
             current_iso: RefCell::new(cfg.iso_path.clone()),
             current_state: Cell::new(VmState::Starting),
             log_window: RefCell::new(None),
             idle_reclaim_timer: RefCell::new(None),
-            boot_sync_timers: RefCell::new(Vec::new()),
+            sync_timers: RefCell::new(Vec::new()),
         });
 
         let controls_ev = Rc::clone(&controls);
@@ -493,8 +607,7 @@ impl VmDisplaySession {
             VmEvent::StateChanged(st) => {
                 controls_ev.update_state(st);
                 on_state_ev(st);
-                if st == VmState::Running && !controls_ev.hidpi_mode.get() {
-                    // Auto-sync 1:1 Smooth 1x resolution shortly after boot so Linux DRM picks it up cleanly
+                if st == VmState::Running {
                     if let Some(sync_fn) = sync_slot_ev.borrow().clone() {
                         sync_fn();
                         for delay in [1.5_f64, 4.5_f64] {
@@ -507,7 +620,7 @@ impl VmDisplaySession {
                                     delay, false, &blk,
                                 )
                             };
-                            controls_ev.boot_sync_timers.borrow_mut().push(t);
+                            controls_ev.sync_timers.borrow_mut().push(t);
                         }
                     }
                 }
@@ -557,24 +670,66 @@ impl VmDisplaySession {
 
         let runner = Rc::new(RefCell::new(runner));
 
-        let sync_1x_resolution: Rc<dyn Fn()> = {
+        // Exact aspect-ratio-preserving resolution sync across 1x Smooth, 1.5x Crisp, and 2x Retina
+        let sync_display_resolution: Rc<dyn Fn()> = {
             let r = Rc::clone(&runner);
             let c = Rc::clone(&controls);
             let view = vm_view.clone();
             Rc::new(move || {
-                if c.hidpi_mode.get() {
-                    return;
-                }
                 if c.current_state.get() != VmState::Running {
                     return;
                 }
                 let bounds = view.bounds();
-                let w = (bounds.size.width.round() as usize).clamp(800, 1920);
-                let h = (bounds.size.height.round() as usize).clamp(600, 1200);
-                r.borrow().reconfigure_display(w, h);
+                if bounds.size.width < 100.0 || bounds.size.height < 100.0 {
+                    return;
+                }
+                let backing = view.convertRectToBacking(bounds);
+                let (raw_w, raw_h) = match c.display_scale.get() {
+                    DisplayScale::Smooth1x => (
+                        bounds.size.width.round() as usize,
+                        bounds.size.height.round() as usize,
+                    ),
+                    DisplayScale::Crisp15x => {
+                        // On Retina 2x displays: 1.5x logical = 2.25x sharper than 1x while saving ~44% pixels vs 2x.
+                        // On 1x external monitors: caps cleanly at native backing pixels (no wasted supersampling).
+                        let w = (bounds.size.width * 1.5)
+                            .min(backing.size.width)
+                            .round() as usize;
+                        let h = (bounds.size.height * 1.5)
+                            .min(backing.size.height)
+                            .round() as usize;
+                        (w, h)
+                    }
+                    DisplayScale::Retina2x => (
+                        backing.size.width.round() as usize,
+                        backing.size.height.round() as usize,
+                    ),
+                };
+                let even_w = (raw_w & !1).clamp(800, 4096);
+                let even_h = (raw_h & !1).clamp(600, 2560);
+                c.active_pixels.set((even_w, even_h));
+                r.borrow().reconfigure_display(even_w, even_h);
+                c.refresh_iso_and_footer();
             })
         };
-        *sync_cb_slot.borrow_mut() = Some(Rc::clone(&sync_1x_resolution));
+        *sync_cb_slot.borrow_mut() = Some(Rc::clone(&sync_display_resolution));
+
+        let schedule_sync_pulse: Rc<dyn Fn()> = {
+            let sync_fn = Rc::clone(&sync_display_resolution);
+            let c = Rc::clone(&controls);
+            Rc::new(move || {
+                sync_fn();
+                // Follow-up sync 350ms later so X11/XFCE/Wayland reliably locks onto fullscreen size
+                let s = Rc::clone(&sync_fn);
+                let blk = RcBlock::new(move |_t: NonNull<NSTimer>| {
+                    s();
+                });
+                let t = unsafe {
+                    NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.35, false, &blk)
+                };
+                c.sync_timers.borrow_mut().push(t);
+            })
+        };
 
         let trigger_save_and_close: Rc<dyn Fn()> = {
             let r = Rc::clone(&runner);
@@ -614,7 +769,7 @@ impl VmDisplaySession {
                     show_error_alert(
                         mtm,
                         "Save State Unavailable",
-                        "This VM configuration does not support saving machine state (e.g., an attached USB ISO or unsupported device).",
+                        "This VM configuration does not support saving machine state.",
                     );
                 }
             });
@@ -670,23 +825,20 @@ impl VmDisplaySession {
         }
         {
             let c = Rc::clone(&controls);
-            let view = vm_view.clone();
-            let sync_1x = Rc::clone(&sync_1x_resolution);
-            let vm_id_hidpi = cfg.id.clone();
-            targets.bind(mtm, &hidpi_cb, move |sender| {
-                let state: isize = unsafe { msg_send![sender, state] };
-                let enabled = state == objc2_app_kit::NSControlStateValueOn;
-                c.hidpi_mode.set(enabled);
-                unsafe {
-                    view.setAutomaticallyReconfiguresDisplay(enabled);
+            let sync_pulse = Rc::clone(&schedule_sync_pulse);
+            let vm_id_scale = cfg.id.clone();
+            targets.bind(mtm, &scale_popup, move |sender| {
+                let idx: isize = unsafe { msg_send![sender, indexOfSelectedItem] };
+                if idx < 0 {
+                    return;
                 }
-                if !enabled {
-                    sync_1x();
-                }
-                c.refresh_iso_and_footer();
+                let scale = DisplayScale::from_index(idx as usize);
+                c.display_scale.set(scale);
+                sync_pulse();
                 if let Ok(st) = VmStore::open_default() {
-                    if let Ok(mut saved) = st.load_vm(&vm_id_hidpi) {
-                        saved.hidpi_display = enabled;
+                    if let Ok(mut saved) = st.load_vm(&vm_id_scale) {
+                        saved.display_scale = Some(scale);
+                        saved.hidpi_display = scale == DisplayScale::Retina2x;
                         let _ = st.save_vm(&saved);
                     }
                 }
@@ -701,7 +853,15 @@ impl VmDisplaySession {
         let on_closed_cb = Rc::clone(&on_closed_rc);
         let r_will_close = Rc::clone(&runner);
         let c_will_close = Rc::clone(&controls);
-        let on_resize = Rc::clone(&sync_1x_resolution);
+        let on_resize = Rc::clone(&schedule_sync_pulse);
+
+        // Fullscreen chrome hide/restore + exact edge-to-edge display resync
+        let c_will_enter_fs = Rc::clone(&controls);
+        let c_did_enter_fs = Rc::clone(&controls);
+        let sync_enter_fs = Rc::clone(&schedule_sync_pulse);
+        let c_will_exit_fs = Rc::clone(&controls);
+        let c_did_exit_fs = Rc::clone(&controls);
+        let sync_exit_fs = Rc::clone(&schedule_sync_pulse);
 
         // Auto-reclaim idle RAM when minimized or unfocused
         let auto_reclaim = cfg.auto_reclaim_ram;
@@ -777,6 +937,20 @@ impl VmDisplaySession {
             },
             move || {
                 on_resize();
+            },
+            move || {
+                c_will_enter_fs.apply_chrome_layout(true);
+            },
+            move || {
+                c_did_enter_fs.apply_chrome_layout(true);
+                sync_enter_fs();
+            },
+            move || {
+                c_will_exit_fs.apply_chrome_layout(false);
+            },
+            move || {
+                c_did_exit_fs.apply_chrome_layout(false);
+                sync_exit_fs();
             },
             move || {
                 if auto_reclaim && c_min.current_state.get() == VmState::Running {
