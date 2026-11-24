@@ -1,0 +1,168 @@
+[package]
+name = "rustvm"
+version = "1.0.0"
+edition = "2024"
+description = "A simple, native macOS VirtualBox-like Linux virtual machine manager written in Rust using Apple Virtualization.framework"
+
+[[bin]]
+name = "rustvm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+block2 = "0.6"
+clap = { version = "4", features = ["derive"] }
+dispatch2 = "0.3"
+flate2 = "1"
+indicatif = "0.18"
+libc = "0.2"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSAlert",
+    "NSApplication",
+    "NSBox",
+    "NSButton",
+    "NSColor",
+    "NSControl",
+    "NSEvent",
+    "NSFont",
+    "NSGraphics",
+    "NSImage",
+    "NSLayoutConstraint",
+    "NSMenu",
+    "NSMenuItem",
+    "NSOpenPanel",
+    "NSPanel",
+    "NSPasteboard",
+    "NSPopUpButton",
+    "NSProgressIndicator",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSSavePanel",
+    "NSScreen",
+    "NSScrollView",
+    "NSSlider",
+    "NSStackView",
+    "NSText",
+    "NSTextField",
+    "NSTextView",
+    "NSView",
+    "NSWindow",
+    "block2",
+    "objc2-core-foundation",
+] }
+objc2-core-foundation = "0.3"
+objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSData",
+    "NSDate",
+    "NSDictionary",
+    "NSError",
+    "NSFileHandle",
+    "NSGeometry",
+    "NSNotification",
+    "NSObject",
+    "NSRunLoop",
+    "NSString",
+    "NSThread",
+    "NSTimer",
+    "NSURL",
+    "NSUUID",
+    "block2",
+    "objc2-core-foundation",
+] }
+objc2-virtualization = { version = "0.3", features = [
+    "VZAudioDeviceConfiguration",
+    "VZAudioInputStreamSource",
+    "VZAudioOutputStreamSink",
+    "VZBootLoader",
+    "VZConsoleDevice",
+    "VZConsoleDeviceConfiguration",
+    "VZConsolePortConfiguration",
+    "VZDirectoryShare",
+    "VZDirectorySharingDevice",
+    "VZDirectorySharingDeviceConfiguration",
+    "VZDiskImageStorageDeviceAttachment",
+    "VZDiskSynchronizationMode",
+    "VZEFIBootLoader",
+    "VZEFIVariableStore",
+    "VZEntropyDeviceConfiguration",
+    "VZError",
+    "VZFileHandleSerialPortAttachment",
+    "VZGenericMachineIdentifier",
+    "VZGenericPlatformConfiguration",
+    "VZGraphicsDevice",
+    "VZGraphicsDeviceConfiguration",
+    "VZGraphicsDisplay",
+    "VZGraphicsDisplayConfiguration",
+    "VZHostAudioInputStreamSource",
+    "VZHostAudioOutputStreamSink",
+    "VZKeyboardConfiguration",
+    "VZLinuxBootLoader",
+    "VZLinuxRosettaDirectoryShare",
+    "VZMACAddress",
+    "VZMemoryBalloonDevice",
+    "VZMemoryBalloonDeviceConfiguration",
+    "VZNATNetworkDeviceAttachment",
+    "VZNetworkDevice",
+    "VZNetworkDeviceAttachment",
+    "VZNetworkDeviceConfiguration",
+    "VZPlatformConfiguration",
+    "VZPointingDeviceConfiguration",
+    "VZSerialPortAttachment",
+    "VZSerialPortConfiguration",
+    "VZSharedDirectory",
+    "VZSingleDirectoryShare",
+    "VZSpiceAgentPortAttachment",
+    "VZStorageDevice",
+    "VZStorageDeviceAttachment",
+    "VZStorageDeviceConfiguration",
+    "VZUSBController",
+    "VZUSBControllerConfiguration",
+    "VZUSBDevice",
+    "VZUSBDeviceConfiguration",
+    "VZUSBKeyboardConfiguration",
+    "VZUSBMassStorageDevice",
+    "VZUSBMassStorageDeviceConfiguration",
+    "VZUSBScreenCoordinatePointingDeviceConfiguration",
+    "VZVirtioBlockDeviceConfiguration",
+    "VZVirtioConsoleDevice",
+    "VZVirtioConsoleDeviceConfiguration",
+    "VZVirtioConsoleDeviceSerialPortConfiguration",
+    "VZVirtioConsolePort",
+    "VZVirtioConsolePortConfiguration",
+    "VZVirtioConsolePortConfigurationArray",
+    "VZVirtioEntropyDeviceConfiguration",
+    "VZVirtioFileSystemDevice",
+    "VZVirtioFileSystemDeviceConfiguration",
+    "VZVirtioGraphicsDevice",
+    "VZVirtioGraphicsDeviceConfiguration",
+    "VZVirtioGraphicsScanout",
+    "VZVirtioGraphicsScanoutConfiguration",
+    "VZVirtioNetworkDeviceConfiguration",
+    "VZVirtioSoundDeviceConfiguration",
+    "VZVirtioSoundDeviceInputStreamConfiguration",
+    "VZVirtioSoundDeviceOutputStreamConfiguration",
+    "VZVirtioSoundDeviceStreamConfiguration",
+    "VZVirtioTraditionalMemoryBalloonDevice",
+    "VZVirtioTraditionalMemoryBalloonDeviceConfiguration",
+    "VZVirtualMachine",
+    "VZVirtualMachineConfiguration",
+    "VZVirtualMachineDelegate",
+    "VZVirtualMachineView",
+    "VZXHCIController",
+    "VZXHCIControllerConfiguration",
+    "block2",
+    "dispatch2",
+    "objc2-app-kit",
+    "objc2-core-foundation",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = false
