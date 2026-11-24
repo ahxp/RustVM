@@ -11,8 +11,8 @@ use objc2_virtualization::{
     VZEFIVariableStore, VZEFIVariableStoreInitializationOptions, VZEntropyDeviceConfiguration,
     VZFileHandleSerialPortAttachment, VZGenericMachineIdentifier, VZGenericPlatformConfiguration,
     VZGraphicsDeviceConfiguration, VZHostAudioInputStreamSource, VZHostAudioOutputStreamSink,
-    VZKeyboardConfiguration, VZLinuxBootLoader, VZLinuxRosettaAvailability,
-    VZLinuxRosettaDirectoryShare,
+    VZKeyboardConfiguration, VZLinuxBootLoader, VZLinuxRosettaAbstractSocketCachingOptions,
+    VZLinuxRosettaAvailability, VZLinuxRosettaCachingOptions, VZLinuxRosettaDirectoryShare,
     VZMACAddress, VZMemoryBalloonDeviceConfiguration, VZNATNetworkDeviceAttachment,
     VZNetworkDeviceAttachment, VZNetworkDeviceConfiguration, VZPlatformConfiguration,
     VZPointingDeviceConfiguration, VZSerialPortAttachment, VZSerialPortConfiguration,
@@ -32,7 +32,7 @@ use objc2_virtualization::{
 use std::fs;
 use std::path::Path;
 
-use crate::config::{VmConfig, VmStore};
+use crate::config::{DiskIoMode, VmConfig, VmStore};
 use crate::vm::console::SerialBridge;
 
 /// Builds and validates an Apple `VZVirtualMachineConfiguration` for a Linux VM.
@@ -102,10 +102,15 @@ pub fn build_vz_configuration(
             vz.setBootLoader(Some(&boot_loader));
         }
 
-        // 3. Generic Platform + persistent Machine Identifier
+        // 3. Generic Platform + persistent Machine Identifier + optional Nested KVM (M3/M4+)
         let platform = VZGenericPlatformConfiguration::new();
         let machine_id = load_or_create_machine_id(&store.machine_id_path(&cfg.id))?;
         platform.setMachineIdentifier(&machine_id);
+        if cfg.enable_nested_virt
+            && VZGenericPlatformConfiguration::isNestedVirtualizationSupported()
+        {
+            platform.setNestedVirtualizationEnabled(true);
+        }
         let platform_super: Retained<VZPlatformConfiguration> = Retained::into_super(platform);
         vz.setPlatform(&platform_super);
 
@@ -118,18 +123,19 @@ pub fn build_vz_configuration(
             );
         }
         let disk_url = file_url(&disk_path)?;
-        // Fast mode uses Uncached (avoids macOS+Linux double-caching in RAM) + Fsync (avoids
-        // slow APFS F_FULLFSYNC write barriers that cause severe UI micro-stutters).
-        let (caching_mode, sync_mode) = if cfg.fast_disk_io {
-            (
+        let (caching_mode, sync_mode) = match cfg.disk_io_mode {
+            DiskIoMode::Fastest => (
+                VZDiskImageCachingMode::Cached,
+                VZDiskImageSynchronizationMode::Fsync,
+            ),
+            DiskIoMode::LowRam => (
                 VZDiskImageCachingMode::Uncached,
                 VZDiskImageSynchronizationMode::Fsync,
-            )
-        } else {
-            (
+            ),
+            DiskIoMode::Strict => (
                 VZDiskImageCachingMode::Automatic,
                 VZDiskImageSynchronizationMode::Full,
-            )
+            ),
         };
         let disk_attachment =
             VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
@@ -197,25 +203,27 @@ pub fn build_vz_configuration(
                 Retained::into_super(mouse);
             vz.setPointingDevices(&NSArray::from_retained_slice(&[mouse_super]));
 
-            // Audio (Virtio Sound: speaker output + mic input)
+            // Audio (Virtio Sound: speaker output, plus opt-in mic input to avoid idle coreaudiod wakeups)
             if cfg.enable_audio {
                 let sound = VZVirtioSoundDeviceConfiguration::new();
+                let mut streams: Vec<Retained<VZVirtioSoundDeviceStreamConfiguration>> = Vec::new();
+
                 let out_stream = VZVirtioSoundDeviceOutputStreamConfiguration::new();
                 let sink = VZHostAudioOutputStreamSink::new();
                 let sink_super: Retained<VZAudioOutputStreamSink> = Retained::into_super(sink);
                 out_stream.setSink(Some(&sink_super));
+                streams.push(Retained::into_super(out_stream));
 
-                let in_stream = VZVirtioSoundDeviceInputStreamConfiguration::new();
-                let source = VZHostAudioInputStreamSource::new();
-                let source_super: Retained<VZAudioInputStreamSource> =
-                    Retained::into_super(source);
-                in_stream.setSource(Some(&source_super));
+                if cfg.enable_mic {
+                    let in_stream = VZVirtioSoundDeviceInputStreamConfiguration::new();
+                    let source = VZHostAudioInputStreamSource::new();
+                    let source_super: Retained<VZAudioInputStreamSource> =
+                        Retained::into_super(source);
+                    in_stream.setSource(Some(&source_super));
+                    streams.push(Retained::into_super(in_stream));
+                }
 
-                let out_super: Retained<VZVirtioSoundDeviceStreamConfiguration> =
-                    Retained::into_super(out_stream);
-                let in_super: Retained<VZVirtioSoundDeviceStreamConfiguration> =
-                    Retained::into_super(in_stream);
-                sound.setStreams(&NSArray::from_retained_slice(&[out_super, in_super]));
+                sound.setStreams(&NSArray::from_retained_slice(&streams));
 
                 let sound_super: Retained<VZAudioDeviceConfiguration> =
                     Retained::into_super(sound);
@@ -302,6 +310,18 @@ pub fn build_vz_configuration(
             if let Ok(rosetta) =
                 VZLinuxRosettaDirectoryShare::initWithError(VZLinuxRosettaDirectoryShare::alloc())
             {
+                // Enable Rosetta AOT translation caching for much faster repeat x86_64 execution
+                let cache_name = NSString::from_str("rosetta");
+                if let Ok(cache_opts) =
+                    VZLinuxRosettaAbstractSocketCachingOptions::initWithName_error(
+                        VZLinuxRosettaAbstractSocketCachingOptions::alloc(),
+                        &cache_name,
+                    )
+                {
+                    let opts_super: Retained<VZLinuxRosettaCachingOptions> =
+                        Retained::into_super(cache_opts);
+                    rosetta.setOptions(Some(&opts_super));
+                }
                 let share_super: Retained<VZDirectoryShare> = Retained::into_super(rosetta);
                 let tag = NSString::from_str("rosetta");
                 let fs_dev = VZVirtioFileSystemDeviceConfiguration::initWithTag(

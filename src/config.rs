@@ -6,6 +6,57 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::disk;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiskIoMode {
+    /// Cached in macOS unified page cache + Fsync (2-5x faster random I/O & app launches)
+    Fastest,
+    /// Uncached (F_NOCACHE) + Fsync (avoids host/guest RAM double-caching)
+    LowRam,
+    /// Automatic caching + Full APFS barrier sync (strictest power-loss durability)
+    Strict,
+}
+
+impl Default for DiskIoMode {
+    fn default() -> Self {
+        Self::Fastest
+    }
+}
+
+impl DiskIoMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Fastest => "Fastest (Cached + Fsync)",
+            Self::LowRam => "Low-RAM (Uncached + Fsync)",
+            Self::Strict => "Strict (Full Sync)",
+        }
+    }
+
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            Self::Fastest => "Fastest Disk",
+            Self::LowRam => "Low-RAM Disk",
+            Self::Strict => "Strict Disk",
+        }
+    }
+
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Fastest,
+            1 => Self::LowRam,
+            _ => Self::Strict,
+        }
+    }
+
+    pub fn to_index(self) -> usize {
+        match self {
+            Self::Fastest => 0,
+            Self::LowRam => 1,
+            Self::Strict => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmConfig {
     pub id: String,
@@ -23,8 +74,10 @@ pub struct VmConfig {
     pub display_ppi: usize,
     #[serde(default)]
     pub hidpi_display: bool,
+    #[serde(default)]
+    pub disk_io_mode: DiskIoMode,
     #[serde(default = "default_true")]
-    pub fast_disk_io: bool,
+    pub auto_reclaim_ram: bool,
     #[serde(default)]
     pub iso_path: Option<PathBuf>,
     #[serde(default)]
@@ -33,10 +86,14 @@ pub struct VmConfig {
     pub shared_folder_readonly: bool,
     #[serde(default = "default_true")]
     pub enable_audio: bool,
+    #[serde(default)]
+    pub enable_mic: bool,
     #[serde(default = "default_true")]
     pub enable_clipboard: bool,
     #[serde(default)]
     pub enable_rosetta: bool,
+    #[serde(default)]
+    pub enable_nested_virt: bool,
     #[serde(default = "generate_mac_address")]
     pub mac_address: String,
     #[serde(default = "now_iso_string")]
@@ -219,6 +276,18 @@ impl VmStore {
         self.vm_dir(id).join("serial.log")
     }
 
+    pub fn saved_state_path(&self, id: &str) -> PathBuf {
+        self.vm_dir(id).join("state.vzsave")
+    }
+
+    pub fn has_saved_state(&self, id: &str) -> bool {
+        self.saved_state_path(id).is_file()
+    }
+
+    pub fn clear_saved_state(&self, id: &str) {
+        let _ = fs::remove_file(self.saved_state_path(id));
+    }
+
     pub fn list_vms(&self) -> Result<Vec<VmConfig>> {
         self.ensure_dirs()?;
         let mut vms = Vec::new();
@@ -308,13 +377,16 @@ impl VmStore {
             display_height: default_display_height(),
             display_ppi: default_display_ppi(),
             hidpi_display: false,
-            fast_disk_io: true,
+            disk_io_mode: DiskIoMode::Fastest,
+            auto_reclaim_ram: true,
             iso_path: req.iso_path,
             shared_folder: req.shared_folder,
             shared_folder_readonly: false,
             enable_audio: req.enable_audio,
+            enable_mic: false,
             enable_clipboard: req.enable_clipboard,
             enable_rosetta: req.enable_rosetta,
+            enable_nested_virt: false,
             mac_address: generate_mac_address(),
             created_at: now_iso_string(),
         };

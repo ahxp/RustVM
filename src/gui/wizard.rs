@@ -10,12 +10,12 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::catalog::{OS_CATALOG, OsPreset, is_preset_downloaded, preset_iso_path};
-use crate::config::{CreateVmRequest, HostSpecs, VmConfig, VmStore, format_memory_mb};
+use crate::config::{CreateVmRequest, DiskIoMode, HostSpecs, VmConfig, VmStore, format_memory_mb};
 use crate::disk;
 use crate::gui::widgets::{
     self, FlippedView, TargetStore, pick_directory, pick_iso_file, rect, show_error_alert,
 };
-use crate::vm::RosettaStatus;
+use crate::vm::{RosettaStatus, is_nested_virtualization_supported};
 
 pub enum WizardMode {
     Create {
@@ -50,14 +50,14 @@ impl VmWizardWindow {
         let store = VmStore::open_default().ok();
 
         let is_edit = matches!(mode, WizardMode::Edit(_));
-        let w = 560.0;
-        let h = if is_edit { 582.0 } else { 632.0 };
+        let w = 576.0;
+        let h = if is_edit { 630.0 } else { 676.0 };
 
         let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 mtm.alloc(),
-                rect(220.0, 140.0, w, h),
+                rect(220.0, 110.0, w, h),
                 style,
                 NSBackingStoreType::Buffered,
                 false,
@@ -76,7 +76,6 @@ impl VmWizardWindow {
         let root = FlippedView::new(mtm, rect(0.0, 0.0, w, h));
         let mut targets = TargetStore::new();
 
-        // Initial form values (RAM slider uses 512 MB steps: 1 = 512 MB, 2 = 1 GB, 8 = 4 GB)
         let (
             init_name,
             init_preset_idx,
@@ -86,9 +85,12 @@ impl VmWizardWindow {
             init_iso,
             init_share,
             init_audio,
+            init_mic,
             init_clip,
             init_rosetta,
-            init_fast_disk,
+            init_nested,
+            init_disk_mode,
+            init_auto_reclaim,
             init_hidpi,
             editing_cfg,
         ) = match mode {
@@ -119,8 +121,11 @@ impl VmWizardWindow {
                     iso,
                     None,
                     true,
+                    false,
                     true,
                     false,
+                    false,
+                    DiskIoMode::Fastest,
                     true,
                     false,
                     None,
@@ -141,9 +146,12 @@ impl VmWizardWindow {
                     cfg.iso_path.clone(),
                     cfg.shared_folder.clone(),
                     cfg.enable_audio,
+                    cfg.enable_mic,
                     cfg.enable_clipboard,
                     cfg.enable_rosetta,
-                    cfg.fast_disk_io,
+                    cfg.enable_nested_virt,
+                    cfg.disk_io_mode,
+                    cfg.auto_reclaim_ram,
                     cfg.hidpi_display,
                     Some(cfg),
                 )
@@ -156,9 +164,12 @@ impl VmWizardWindow {
         let iso_val = Rc::new(RefCell::new(init_iso.clone()));
         let share_val = Rc::new(RefCell::new(init_share.clone()));
         let audio_val = Rc::new(Cell::new(init_audio));
+        let mic_val = Rc::new(Cell::new(init_mic));
         let clip_val = Rc::new(Cell::new(init_clip));
         let rosetta_val = Rc::new(Cell::new(init_rosetta));
-        let fast_disk_val = Rc::new(Cell::new(init_fast_disk));
+        let nested_val = Rc::new(Cell::new(init_nested));
+        let disk_mode_val = Rc::new(Cell::new(init_disk_mode));
+        let auto_reclaim_val = Rc::new(Cell::new(init_auto_reclaim));
         let hidpi_val = Rc::new(Cell::new(init_hidpi));
         let start_now_val = Rc::new(Cell::new(true));
         let preset_idx_val = Rc::new(Cell::new(init_preset_idx));
@@ -188,9 +199,9 @@ impl VmWizardWindow {
             name_field.setEditable(false);
         }
         root.addSubview(&name_field);
-        y += 36.0;
+        y += 34.0;
 
-        // 2. OS Preset (only shown as active selector in Create mode)
+        // 2. OS Preset
         let mut preset_items: Vec<String> = OS_CATALOG
             .iter()
             .map(|p| {
@@ -208,10 +219,9 @@ impl VmWizardWindow {
         preset_items.push("Custom ARM64 Linux ISO".to_string());
         let preset_refs: Vec<&str> = preset_items.iter().map(|s| s.as_str()).collect();
 
-        // Forward references for widgets updated by preset dropdown
         let iso_field = widgets::text_input(
             mtm,
-            rect(ctrl_x, y + 38.0, ctrl_w - 150.0, 24.0),
+            rect(ctrl_x, y + 36.0, ctrl_w - 150.0, 24.0),
             &init_iso
                 .as_ref()
                 .map(|p| p.display().to_string())
@@ -226,19 +236,19 @@ impl VmWizardWindow {
 
         let cpu_readout = widgets::semibold_label(
             mtm,
-            rect(ctrl_x + ctrl_w - 108.0, y + 82.0, 108.0, 18.0),
+            rect(ctrl_x + ctrl_w - 108.0, y + 78.0, 108.0, 18.0),
             &format!("{} vCPUs", init_cpus),
             12.5,
         );
         let ram_readout = widgets::semibold_label(
             mtm,
-            rect(ctrl_x + ctrl_w - 108.0, y + 120.0, 108.0, 18.0),
+            rect(ctrl_x + ctrl_w - 108.0, y + 114.0, 108.0, 18.0),
             &format_memory_mb(init_ram_mb),
             12.5,
         );
         let disk_readout = widgets::semibold_label(
             mtm,
-            rect(ctrl_x + ctrl_w - 108.0, y + 158.0, 108.0, 18.0),
+            rect(ctrl_x + ctrl_w - 108.0, y + 150.0, 108.0, 18.0),
             &format!("{} GB", init_disk_gb),
             12.5,
         );
@@ -252,7 +262,7 @@ impl VmWizardWindow {
             let cr = cpu_readout.clone();
             cpu_slider = widgets::slider(
                 mtm,
-                rect(ctrl_x, y + 80.0, ctrl_w - 118.0, 22.0),
+                rect(ctrl_x, y + 76.0, ctrl_w - 118.0, 22.0),
                 1.0,
                 max_cpus,
                 init_cpus as f64,
@@ -269,7 +279,7 @@ impl VmWizardWindow {
             let rr = ram_readout.clone();
             ram_slider = widgets::slider(
                 mtm,
-                rect(ctrl_x, y + 118.0, ctrl_w - 118.0, 22.0),
+                rect(ctrl_x, y + 112.0, ctrl_w - 118.0, 22.0),
                 1.0,
                 max_ram_half_gb,
                 (init_ram_mb as f64 / 512.0).round().max(1.0),
@@ -286,7 +296,7 @@ impl VmWizardWindow {
             let dr = disk_readout.clone();
             disk_slider = widgets::slider(
                 mtm,
-                rect(ctrl_x, y + 156.0, ctrl_w - 118.0, 22.0),
+                rect(ctrl_x, y + 148.0, ctrl_w - 118.0, 22.0),
                 min_disk_gb,
                 256.0_f64.max(min_disk_gb),
                 init_disk_gb as f64,
@@ -299,7 +309,6 @@ impl VmWizardWindow {
             );
         }
 
-        // Preset dropdown row
         root.addSubview(&widgets::semibold_label(mtm, rect(lbl_x, y + 4.0, 120.0, 18.0), "Linux OS:", 13.0));
         let preset_popup: Retained<NSPopUpButton> = {
             let pidx = Rc::clone(&preset_idx_val);
@@ -359,8 +368,8 @@ impl VmWizardWindow {
         }
         root.addSubview(&preset_popup);
 
-        // 3. Installer ISO row (y + 38)
-        let iso_y = y + 38.0;
+        // 3. Installer ISO
+        let iso_y = y + 36.0;
         root.addSubview(&widgets::semibold_label(mtm, rect(lbl_x, iso_y + 3.0, 120.0, 18.0), "Installer ISO:", 13.0));
         root.addSubview(&iso_field);
         {
@@ -398,35 +407,48 @@ impl VmWizardWindow {
             root.addSubview(&dl_btn);
         }
 
-        // 4. CPU / RAM / Disk slider rows
-        root.addSubview(&widgets::semibold_label(mtm, rect(lbl_x, y + 82.0, 120.0, 18.0), "CPU Cores:", 13.0));
+        // 4. CPU / RAM / Disk sliders
+        root.addSubview(&widgets::semibold_label(mtm, rect(lbl_x, y + 78.0, 120.0, 18.0), "CPU Cores:", 13.0));
         root.addSubview(&cpu_slider);
         root.addSubview(&cpu_readout);
 
-        root.addSubview(&widgets::semibold_label(mtm, rect(lbl_x, y + 120.0, 120.0, 18.0), "Memory (RAM):", 13.0));
+        root.addSubview(&widgets::semibold_label(mtm, rect(lbl_x, y + 114.0, 120.0, 18.0), "Memory (RAM):", 13.0));
         root.addSubview(&ram_slider);
         root.addSubview(&ram_readout);
 
         root.addSubview(&widgets::semibold_label(
             mtm,
-            rect(lbl_x, y + 158.0, 120.0, 18.0),
+            rect(lbl_x, y + 150.0, 120.0, 18.0),
             if is_edit { "Disk (Grow):" } else { "Virtual Disk:" },
             13.0,
         ));
         root.addSubview(&disk_slider);
         root.addSubview(&disk_readout);
 
-        let disk_note = widgets::secondary_label(
-            mtm,
-            rect(ctrl_x, y + 182.0, ctrl_w, 16.0),
-            "Sparse APFS image — consumes almost zero disk space until Linux writes files.",
-            11.0,
-        );
-        root.addSubview(&disk_note);
+        y += 186.0;
 
-        y += 210.0;
+        // 5. Disk I/O Mode dropdown
+        root.addSubview(&widgets::semibold_label(mtm, rect(lbl_x, y + 4.0, 120.0, 18.0), "Disk I/O Mode:", 13.0));
+        {
+            let dmv = Rc::clone(&disk_mode_val);
+            let disk_modes = [
+                DiskIoMode::Fastest.label(),
+                DiskIoMode::LowRam.label(),
+                DiskIoMode::Strict.label(),
+            ];
+            let dm_popup = widgets::popup(
+                mtm,
+                rect(ctrl_x, y, ctrl_w, 26.0),
+                &disk_modes,
+                init_disk_mode.to_index(),
+                &mut targets,
+                move |idx| dmv.set(DiskIoMode::from_index(idx)),
+            );
+            root.addSubview(&dm_popup);
+        }
+        y += 34.0;
 
-        // 5. Shared Host Folder (VirtioFS)
+        // 6. Shared Host Folder
         root.addSubview(&widgets::semibold_label(mtm, rect(lbl_x, y + 3.0, 120.0, 18.0), "Shared Folder:", 13.0));
         let share_field = widgets::text_input(
             mtm,
@@ -472,24 +494,24 @@ impl VmWizardWindow {
             root.addSubview(&clear_btn);
         }
 
-        y += 38.0;
+        y += 36.0;
         root.addSubview(&widgets::separator(mtm, rect(lbl_x, y, w - 44.0, 1.0)));
-        y += 14.0;
+        y += 12.0;
 
-        // 6. Performance & feature checkboxes
+        // 7. Performance & Hardware Feature Checkboxes
         {
-            let fv = Rc::clone(&fast_disk_val);
+            let arv = Rc::clone(&auto_reclaim_val);
             let cb = widgets::checkbox(
                 mtm,
                 rect(ctrl_x, y, ctrl_w, 20.0),
-                "Fast & Low-RAM Disk I/O (Uncached + Fsync — reduces lag)",
-                init_fast_disk,
+                "Auto-Reclaim Idle RAM when minimized or inactive",
+                init_auto_reclaim,
                 &mut targets,
-                move |b| fv.set(b),
+                move |b| arv.set(b),
             );
             root.addSubview(&cb);
         }
-        y += 26.0;
+        y += 24.0;
         {
             let hv = Rc::clone(&hidpi_val);
             let cb = widgets::checkbox(
@@ -502,40 +524,74 @@ impl VmWizardWindow {
             );
             root.addSubview(&cb);
         }
-        y += 26.0;
+        y += 24.0;
         {
             let av = Rc::clone(&audio_val);
             let cb = widgets::checkbox(
                 mtm,
-                rect(ctrl_x, y, ctrl_w, 20.0),
-                "Enable Virtual Audio (Virtio Sound speaker & mic)",
+                rect(ctrl_x, y, 195.0, 20.0),
+                "Speaker Audio (Virtio Sound)",
                 init_audio,
                 &mut targets,
                 move |b| av.set(b),
             );
             root.addSubview(&cb);
+
+            let mv = Rc::clone(&mic_val);
+            let mic_cb = widgets::checkbox(
+                mtm,
+                rect(ctrl_x + 204.0, y, ctrl_w - 204.0, 20.0),
+                "Microphone Input (opt-in)",
+                init_mic,
+                &mut targets,
+                move |b| mv.set(b),
+            );
+            root.addSubview(&mic_cb);
         }
-        y += 26.0;
+        y += 24.0;
         {
             let cv = Rc::clone(&clip_val);
             let cb = widgets::checkbox(
                 mtm,
                 rect(ctrl_x, y, ctrl_w, 20.0),
-                "Enable Host ↔ Guest Clipboard Sharing (SPICE Agent)",
+                "Host ↔ Guest Clipboard Sharing (SPICE Agent)",
                 init_clip,
                 &mut targets,
                 move |b| cv.set(b),
             );
             root.addSubview(&cb);
         }
-        y += 26.0;
+        y += 24.0;
+        {
+            let nested_supported = is_nested_virtualization_supported();
+            let nv = Rc::clone(&nested_val);
+            let cb: Retained<NSButton> = widgets::checkbox(
+                mtm,
+                rect(ctrl_x, y, ctrl_w, 20.0),
+                if nested_supported {
+                    "Nested Virtualization (KVM / Docker on M3/M4)"
+                } else {
+                    "Nested Virtualization (requires M3+ Mac)"
+                },
+                init_nested && nested_supported,
+                &mut targets,
+                move |b| nv.set(b),
+            );
+            if !nested_supported {
+                cb.setEnabled(false);
+                cb.setState(NSControlStateValueOff);
+                nested_val.set(false);
+            }
+            root.addSubview(&cb);
+        }
+        y += 24.0;
         {
             let rosetta_status = RosettaStatus::detect();
             let rv = Rc::clone(&rosetta_val);
             let cb: Retained<NSButton> = widgets::checkbox(
                 mtm,
                 rect(ctrl_x, y, ctrl_w, 20.0),
-                &format!("Enable Apple Rosetta x86_64 ({})", rosetta_status.label()),
+                &format!("Apple Rosetta x86_64 w/ AOT Cache ({})", rosetta_status.label()),
                 init_rosetta && rosetta_status == RosettaStatus::Installed,
                 &mut targets,
                 move |b| rv.set(b),
@@ -549,7 +605,7 @@ impl VmWizardWindow {
         }
 
         if !is_edit {
-            y += 30.0;
+            y += 28.0;
             let sn = Rc::clone(&start_now_val);
             let cb = widgets::checkbox(
                 mtm,
@@ -609,10 +665,15 @@ impl VmWizardWindow {
                     cfg.iso_path = iso_val.borrow().clone();
                     cfg.shared_folder = share_val.borrow().clone();
                     cfg.enable_audio = audio_val.get();
+                    cfg.enable_mic = mic_val.get();
                     cfg.enable_clipboard = clip_val.get();
                     cfg.enable_rosetta = rosetta_val.get();
-                    cfg.fast_disk_io = fast_disk_val.get();
+                    cfg.enable_nested_virt = nested_val.get();
+                    cfg.disk_io_mode = disk_mode_val.get();
+                    cfg.auto_reclaim_ram = auto_reclaim_val.get();
                     cfg.hidpi_display = hidpi_val.get();
+                    // Changing hardware invalidates any previously saved snapshot
+                    store.clear_saved_state(&cfg.id);
                     if let Err(e) = store.save_vm(&cfg) {
                         show_error_alert(mtm, "Failed to Save Settings", &e.to_string());
                         return;
@@ -641,7 +702,10 @@ impl VmWizardWindow {
                     };
                     match store.create_vm(req) {
                         Ok(mut cfg) => {
-                            cfg.fast_disk_io = fast_disk_val.get();
+                            cfg.enable_mic = mic_val.get();
+                            cfg.enable_nested_virt = nested_val.get();
+                            cfg.disk_io_mode = disk_mode_val.get();
+                            cfg.auto_reclaim_ram = auto_reclaim_val.get();
                             cfg.hidpi_display = hidpi_val.get();
                             let _ = store.save_vm(&cfg);
                             let start_now = start_now_val.get();

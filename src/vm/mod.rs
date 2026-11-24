@@ -5,8 +5,8 @@ pub mod runner;
 use std::path::PathBuf;
 
 use objc2_virtualization::{
-    VZLinuxRosettaAvailability, VZLinuxRosettaDirectoryShare, VZVirtualMachine,
-    VZVirtualMachineState,
+    VZGenericPlatformConfiguration, VZLinuxRosettaAvailability, VZLinuxRosettaDirectoryShare,
+    VZVirtualMachine, VZVirtualMachineState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +17,8 @@ pub enum VmState {
     Pausing,
     Paused,
     Resuming,
+    Saving,
+    Restoring,
     Stopping,
     Error,
 }
@@ -30,6 +32,8 @@ impl VmState {
             VZVirtualMachineState::Pausing => Self::Pausing,
             VZVirtualMachineState::Paused => Self::Paused,
             VZVirtualMachineState::Resuming => Self::Resuming,
+            VZVirtualMachineState::Saving => Self::Saving,
+            VZVirtualMachineState::Restoring => Self::Restoring,
             VZVirtualMachineState::Stopping => Self::Stopping,
             VZVirtualMachineState::Error => Self::Error,
             _ => Self::Stopped,
@@ -44,6 +48,8 @@ impl VmState {
             Self::Pausing => "Pausing…",
             Self::Paused => "Paused",
             Self::Resuming => "Resuming…",
+            Self::Saving => "Saving…",
+            Self::Restoring => "Restoring…",
             Self::Stopping => "Stopping…",
             Self::Error => "Error",
         }
@@ -52,7 +58,14 @@ impl VmState {
     pub fn is_active(&self) -> bool {
         matches!(
             self,
-            Self::Starting | Self::Running | Self::Pausing | Self::Paused | Self::Resuming | Self::Stopping
+            Self::Starting
+                | Self::Running
+                | Self::Pausing
+                | Self::Paused
+                | Self::Resuming
+                | Self::Saving
+                | Self::Restoring
+                | Self::Stopping
         )
     }
 }
@@ -94,4 +107,8 @@ impl RosettaStatus {
 
 pub fn is_virtualization_supported() -> bool {
     unsafe { VZVirtualMachine::isSupported() }
+}
+
+pub fn is_nested_virtualization_supported() -> bool {
+    unsafe { VZGenericPlatformConfiguration::isNestedVirtualizationSupported() }
 }

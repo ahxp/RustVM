@@ -17,12 +17,13 @@ A simple, fast, VirtualBox-style Linux virtual machine manager written in **100%
 - **Live USB ISO Attach & Eject**: Attach an installer ISO to install Linux onto a sparse APFS virtual disk, then click **Eject ISO** (even while the VM is running!) and reboot straight into your installed OS.
 - **Full Virtual Hardware & Performance Tuning**:
   - UEFI boot (`VZEFIBootLoader`) with persistent NVRAM (`nvram.bin`)
-  - **Smooth 1× Display Mode** (default) with live **HiDPI (2×)** toggle on the toolbar — avoids 2× Retina software-rendering lag while dynamically resizing Linux to fit your window
-  - **Fast & Low-RAM Disk I/O** (`Uncached + Fsync`) to avoid APFS `F_FULLFSYNC` stutters and host/guest memory double-caching
-  - **Live `Free RAM` Button** (Virtio memory balloon pulse) to reclaim unused Linux page cache back to macOS on demand
-  - USB keyboard & seamless absolute mouse, automatic NAT networking, Virtio-Sound audio, and SPICE clipboard sharing
+  - **Instant Suspend / Resume (`Save & Close`)**: freezes VM state to disk (`state.vzsave`) so closed VMs use **0 MB RAM / 0% CPU** and resume in ~1–2 seconds
+  - **Smooth 1× Display Mode** (1:1 crisp pixel sync on boot & resize) with live **HiDPI (2×)** toggle on the toolbar
+  - **3 Disk I/O Modes**: **Fastest** (`Cached + Fsync`, default — 2×–5× faster random I/O), **Low-RAM** (`Uncached + Fsync`), and **Strict** (`Full Sync`), plus `Uncached` ISO reads
+  - **Live `Free RAM` & Auto-Reclaim**: automatically reclaims unused Linux page cache when minimized or inactive (Virtio memory balloon pulse)
+  - USB keyboard & seamless absolute mouse, automatic NAT networking, Virtio-Sound speakers (opt-in mic to avoid idle wakeups), and SPICE clipboard sharing
   - **Shared Host Folders (VirtioFS)** — share any macOS folder with Linux
-  - Optional **Apple Rosetta x86_64** share for running x86_64 binaries inside ARM64 Linux
+  - **Nested Virtualization (KVM / Docker)** on M3/M4 Macs + optional **Apple Rosetta x86_64** with AOT translation caching
   - Interactive **Headless Serial Console** (`--headless`) right inside Terminal
 
 ## Requirements
@@ -45,7 +46,7 @@ To also install `RustVM.app` into `~/Applications`:
 ./setup.sh --install-app
 ```
 
-To package a distributable macOS `.dmg` installer (`dist/RustVM-1.0.0-arm64.dmg`):
+To package a distributable macOS `.dmg` installer (`dist/RustVM-1.1.0-arm64.dmg`):
 
 ```bash
 ./build-dmg.sh

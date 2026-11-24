@@ -11,14 +11,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::catalog::{OS_CATALOG, OsPreset, find_preset, is_preset_downloaded, preset_iso_path};
 use crate::config::{
-    CreateVmRequest, HostSpecs, VmConfig, VmStore, format_bytes, format_memory_mb,
+    CreateVmRequest, DiskIoMode, HostSpecs, VmConfig, VmStore, format_bytes, format_memory_mb,
 };
 use crate::disk;
 use crate::download;
 use crate::gui;
 use crate::vm::console::SerialBridge;
 use crate::vm::runner::VmRunner;
-use crate::vm::{RosettaStatus, VmEvent, VmState, is_virtualization_supported};
+use crate::vm::{
+    RosettaStatus, VmEvent, VmState, is_nested_virtualization_supported,
+    is_virtualization_supported,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -151,18 +154,30 @@ pub enum Commands {
         /// Enable or disable Rosetta x86_64 translation share
         #[arg(long)]
         rosetta: Option<bool>,
-        /// Enable or disable virtual audio
+        /// Enable or disable virtual speaker audio
         #[arg(long)]
         audio: Option<bool>,
+        /// Enable or disable virtual microphone input (off by default to reduce wakeups)
+        #[arg(long)]
+        mic: Option<bool>,
         /// Enable or disable SPICE clipboard sharing
         #[arg(long)]
         clipboard: Option<bool>,
         /// Enable or disable HiDPI 2x Retina display (false = Smooth 1x, 4x faster GUI)
         #[arg(long)]
         hidpi: Option<bool>,
-        /// Enable or disable fast Uncached + Fsync disk I/O (true = smoother, lower host RAM)
+        /// Disk I/O mode: fastest (Cached+Fsync), low-ram (Uncached+Fsync), or strict (Full Sync)
         #[arg(long)]
-        fast_disk: Option<bool>,
+        disk_mode: Option<String>,
+        /// Enable or disable automatic idle RAM reclaim when minimized/inactive
+        #[arg(long)]
+        auto_reclaim: Option<bool>,
+        /// Enable or disable nested virtualization (KVM/Docker on M3/M4 Macs)
+        #[arg(long)]
+        nested_virt: Option<bool>,
+        /// Discard any saved VM state snapshot so next boot starts fresh
+        #[arg(long)]
+        discard_state: bool,
         /// Set display resolution as WIDTHxHEIGHT (e.g. 1280x800)
         #[arg(long)]
         resolution: Option<String>,
@@ -384,9 +399,13 @@ pub fn run(cli: Cli) -> Result<()> {
             unshare,
             rosetta,
             audio,
+            mic,
             clipboard,
             hidpi,
-            fast_disk,
+            disk_mode,
+            auto_reclaim,
+            nested_virt,
+            discard_state,
             resolution,
         }) => {
             let mut cfg = store.load_vm(&name)?;
@@ -416,14 +435,30 @@ pub fn run(cli: Cli) -> Result<()> {
             if let Some(a) = audio {
                 cfg.enable_audio = a;
             }
+            if let Some(m) = mic {
+                cfg.enable_mic = m;
+            }
             if let Some(c) = clipboard {
                 cfg.enable_clipboard = c;
             }
             if let Some(h) = hidpi {
                 cfg.hidpi_display = h;
             }
-            if let Some(fd) = fast_disk {
-                cfg.fast_disk_io = fd;
+            if let Some(dm) = disk_mode {
+                cfg.disk_io_mode = match dm.trim().to_lowercase().as_str() {
+                    "fastest" | "cached" => DiskIoMode::Fastest,
+                    "low-ram" | "lowram" | "uncached" => DiskIoMode::LowRam,
+                    "strict" | "full" => DiskIoMode::Strict,
+                    other => bail!(
+                        "Invalid --disk-mode '{other}'. Expected: fastest, low-ram, or strict"
+                    ),
+                };
+            }
+            if let Some(ar) = auto_reclaim {
+                cfg.auto_reclaim_ram = ar;
+            }
+            if let Some(nv) = nested_virt {
+                cfg.enable_nested_virt = nv;
             }
             if let Some(res) = resolution {
                 let parts: Vec<&str> = res.split(['x', 'X']).collect();
@@ -437,6 +472,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
                 cfg.display_width = w;
                 cfg.display_height = h;
+            }
+            if discard_state || cpus.is_some() || ram.is_some() || disk_grow.is_some() {
+                store.clear_saved_state(&cfg.id);
             }
             store.save_vm(&cfg)?;
             println!("Updated configuration for '{}'.", cfg.name);
@@ -578,8 +616,24 @@ fn cmd_info(store: &VmStore, cfg: &VmConfig) -> Result<()> {
     let usage = disk::disk_usage(&store.disk_path(&cfg.id));
     println!("Virtual Machine : {} (id: {})", cfg.name, cfg.id);
     println!("OS Preset       : {}", cfg.os_preset.as_deref().unwrap_or("Custom Linux"));
-    println!("CPUs            : {} vCPUs", cfg.cpus);
-    println!("Memory          : {}", format_memory_mb(cfg.memory_mb));
+    println!(
+        "Saved State     : {}",
+        if store.has_saved_state(&cfg.id) {
+            "Ready (instant resume)"
+        } else {
+            "None"
+        }
+    );
+    println!(
+        "CPUs            : {} vCPUs{}",
+        cfg.cpus,
+        if cfg.enable_nested_virt { " (Nested KVM enabled)" } else { "" }
+    );
+    println!(
+        "Memory          : {} (Auto-Reclaim={})",
+        format_memory_mb(cfg.memory_mb),
+        if cfg.auto_reclaim_ram { "On" } else { "Off" }
+    );
     println!(
         "Virtual Disk    : {} GB allocated ({} used on disk)",
         cfg.disk_gb,
@@ -594,14 +648,7 @@ fn cmd_info(store: &VmStore, cfg: &VmConfig) -> Result<()> {
         cfg.display_height,
         if cfg.hidpi_display { "HiDPI 2x" } else { "Smooth 1x" }
     );
-    println!(
-        "Disk I/O Mode   : {}",
-        if cfg.fast_disk_io {
-            "Fast (Uncached + Fsync)"
-        } else {
-            "Strict (Full Sync)"
-        }
-    );
+    println!("Disk I/O Mode   : {}", cfg.disk_io_mode.label());
     println!("Network         : NAT (MAC {})", cfg.mac_address);
     println!(
         "Installer ISO   : {}",
@@ -611,12 +658,18 @@ fn cmd_info(store: &VmStore, cfg: &VmConfig) -> Result<()> {
             .unwrap_or_else(|| "None (boots virtual disk)".to_string())
     );
     println!(
-        "Audio / Clipb.  : Audio={} | SPICE Clipboard={}",
+        "Audio / Clipb.  : Speakers={} | Mic={} | SPICE Clipboard={}",
         if cfg.enable_audio { "On" } else { "Off" },
+        if cfg.enable_audio && cfg.enable_mic { "On" } else { "Off" },
         if cfg.enable_clipboard { "On" } else { "Off" }
     );
     println!(
-        "Rosetta x86_64  : {} (Host: {})",
+        "Nested KVM      : {} (Host: {})",
+        if cfg.enable_nested_virt { "Enabled" } else { "Disabled" },
+        if is_nested_virtualization_supported() { "Supported" } else { "Not supported" }
+    );
+    println!(
+        "Rosetta x86_64  : {} (AOT cache enabled when on | Host: {})",
         if cfg.enable_rosetta { "Enabled" } else { "Disabled" },
         RosettaStatus::detect().label()
     );

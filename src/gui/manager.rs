@@ -412,6 +412,7 @@ impl ManagerApp {
             return;
         }
 
+        let store_opt = VmStore::open_default().ok();
         let mut targets = self.sidebar_targets.borrow_mut();
         let mut y = 6.0;
         let row_h = 56.0;
@@ -420,6 +421,11 @@ impl ManagerApp {
         for vm in vms {
             let is_sel = selected.as_deref() == Some(vm.id.as_str());
             let state = self.vm_state(&vm.id);
+            let has_saved = !state.is_active()
+                && store_opt
+                    .as_ref()
+                    .map(|s| s.has_saved_state(&vm.id))
+                    .unwrap_or(false);
 
             let (fill, border) = if is_sel {
                 (
@@ -431,16 +437,21 @@ impl ManagerApp {
             };
             let (card_box, card_view) = widgets::tint_card(mtm, rect(12.0, y, row_w, row_h), &fill, &border, 8.0);
 
-            let dot_color = state_color(state);
+            let dot_color = if has_saved {
+                NSColor::systemPurpleColor()
+            } else {
+                state_color(state)
+            };
             let dot = widgets::status_dot(mtm, 12.0, 15.0, &dot_color);
             card_view.addSubview(&dot);
 
             let title = widgets::semibold_label(mtm, rect(28.0, 10.0, row_w - 38.0, 18.0), &vm.name, 13.0);
+            let status_txt = if has_saved { "Saved" } else { state.label() };
             let sub_text = format!(
                 "{} vCPU · {} · {}",
                 vm.cpus,
                 format_memory_mb(vm.memory_mb),
-                state.label()
+                status_txt
             );
             let sub = widgets::secondary_label(mtm, rect(28.0, 30.0, row_w - 38.0, 16.0), &sub_text, 11.0);
             card_view.addSubview(&title);
@@ -495,6 +506,7 @@ impl ManagerApp {
         };
         let state = self.vm_state(&vm.id);
         let is_active = state.is_active();
+        let has_saved = !is_active && store.has_saved_state(&vm.id);
         let disk_path = store.disk_path(&vm.id);
         let usage = disk::disk_usage(&disk_path);
 
@@ -506,11 +518,17 @@ impl ManagerApp {
         let name_lbl = widgets::bold_label(mtm, rect(pad_x, y, 440.0, 28.0), &vm.name, 22.0);
         self.detail_container.addSubview(&name_lbl);
 
-        let dot = widgets::status_dot(mtm, pad_x + content_w - 110.0, y + 9.0, &state_color(state));
+        let dot_col = if has_saved {
+            NSColor::systemPurpleColor()
+        } else {
+            state_color(state)
+        };
+        let state_text = if has_saved { "Saved" } else { state.label() };
+        let dot = widgets::status_dot(mtm, pad_x + content_w - 110.0, y + 9.0, &dot_col);
         let st_lbl = widgets::semibold_label(
             mtm,
             rect(pad_x + content_w - 94.0, y + 5.0, 96.0, 18.0),
-            state.label(),
+            state_text,
             13.0,
         );
         self.detail_container.addSubview(&dot);
@@ -530,19 +548,43 @@ impl ManagerApp {
         {
             let weak = Rc::downgrade(self);
             let id = vm.id.clone();
-            let title = if is_active { "Show Display" } else { "▶ Start" };
-            let btn = widgets::primary_button(mtm, rect(pad_x, y, 114.0, 32.0), title, &mut targets, move || {
+            let title = if is_active {
+                "Show Display"
+            } else if has_saved {
+                "⚡ Resume Saved"
+            } else {
+                "▶ Start"
+            };
+            let btn = widgets::primary_button(mtm, rect(pad_x, y, 126.0, 32.0), title, &mut targets, move || {
                 if let Some(app) = weak.upgrade() {
                     app.start_or_focus_vm(&id);
                 }
             });
             self.detail_container.addSubview(&btn);
         }
-        {
+        if has_saved {
+            let weak = Rc::downgrade(self);
+            let id = vm.id.clone();
+            let btn = widgets::push_button(
+                mtm,
+                rect(pad_x + 132.0, y, 114.0, 32.0),
+                "↺ Discard Save",
+                &mut targets,
+                move || {
+                    if let Some(app) = weak.upgrade() {
+                        if let Ok(st) = VmStore::open_default() {
+                            st.clear_saved_state(&id);
+                            app.reload_vms(Some(id.clone()));
+                        }
+                    }
+                },
+            );
+            self.detail_container.addSubview(&btn);
+        } else {
             let weak = Rc::downgrade(self);
             let id = vm.id.clone();
             let title = if state == VmState::Paused { "▶ Resume" } else { "⏸ Pause" };
-            let btn = widgets::push_button(mtm, rect(pad_x + 122.0, y, 94.0, 32.0), title, &mut targets, move || {
+            let btn = widgets::push_button(mtm, rect(pad_x + 132.0, y, 92.0, 32.0), title, &mut targets, move || {
                 if let Some(app) = weak.upgrade() {
                     if let Some(sess) = app.sessions.borrow().get(&id).cloned() {
                         sess.pause_or_resume();
@@ -555,7 +597,32 @@ impl ManagerApp {
         {
             let weak = Rc::downgrade(self);
             let id = vm.id.clone();
-            let btn = widgets::push_button(mtm, rect(pad_x + 224.0, y, 102.0, 32.0), "⏻ Shutdown", &mut targets, move || {
+            let can_save_live = self
+                .sessions
+                .borrow()
+                .get(&vm.id)
+                .map(|s| s.can_save_state())
+                .unwrap_or(false);
+            let btn = widgets::push_button(
+                mtm,
+                rect(pad_x + 252.0, y, 92.0, 32.0),
+                "💾 Save",
+                &mut targets,
+                move || {
+                    if let Some(app) = weak.upgrade() {
+                        if let Some(sess) = app.sessions.borrow().get(&id).cloned() {
+                            sess.save_state_and_close();
+                        }
+                    }
+                },
+            );
+            btn.setEnabled(can_save_live && matches!(state, VmState::Running | VmState::Paused));
+            self.detail_container.addSubview(&btn);
+        }
+        {
+            let weak = Rc::downgrade(self);
+            let id = vm.id.clone();
+            let btn = widgets::push_button(mtm, rect(pad_x + 350.0, y, 96.0, 32.0), "⏻ Shutdown", &mut targets, move || {
                 if let Some(app) = weak.upgrade() {
                     if let Some(sess) = app.sessions.borrow().get(&id).cloned() {
                         sess.request_stop();
@@ -568,7 +635,7 @@ impl ManagerApp {
         {
             let weak = Rc::downgrade(self);
             let id = vm.id.clone();
-            let btn = widgets::push_button(mtm, rect(pad_x + 334.0, y, 96.0, 32.0), "■ Stop", &mut targets, move || {
+            let btn = widgets::push_button(mtm, rect(pad_x + 452.0, y, 66.0, 32.0), "■ Stop", &mut targets, move || {
                 if let Some(app) = weak.upgrade() {
                     if let Some(sess) = app.sessions.borrow().get(&id).cloned() {
                         sess.force_stop();
@@ -581,7 +648,7 @@ impl ManagerApp {
         {
             let weak = Rc::downgrade(self);
             let cfg_edit = vm.clone();
-            let btn = widgets::push_button(mtm, rect(pad_x + 448.0, y, 96.0, 32.0), "⚙ Settings", &mut targets, move || {
+            let btn = widgets::push_button(mtm, rect(pad_x + 524.0, y, 74.0, 32.0), "⚙ Edit", &mut targets, move || {
                 if let Some(app) = weak.upgrade() {
                     app.open_edit_wizard(cfg_edit.clone());
                 }
@@ -593,7 +660,7 @@ impl ManagerApp {
             let weak = Rc::downgrade(self);
             let id = vm.id.clone();
             let name = vm.name.clone();
-            let btn = widgets::push_button(mtm, rect(pad_x + 552.0, y, 94.0, 32.0), "🗑 Delete", &mut targets, move || {
+            let btn = widgets::push_button(mtm, rect(pad_x + 602.0, y, 52.0, 32.0), "🗑", &mut targets, move || {
                 if let Some(app) = weak.upgrade() {
                     let ok = show_confirm_alert(
                         mtm,
@@ -619,13 +686,23 @@ impl ManagerApp {
 
         y += 48.0;
 
-        // 3. Hardware & Devices Card
+        // 3. Hardware & Performance Card
         let (hw_box, hw_view) = widgets::card(mtm, rect(pad_x, y, content_w, 126.0));
         hw_view.addSubview(&widgets::semibold_label(mtm, rect(16.0, 12.0, 260.0, 18.0), "HARDWARE & PERFORMANCE", 11.5));
         hw_view.addSubview(&widgets::separator(mtm, rect(16.0, 34.0, content_w - 32.0, 1.0)));
 
-        add_kv_row(mtm, &hw_view, 16.0, 44.0, "Processors", &format!("{} vCPUs (Apple Silicon Native)", vm.cpus));
-        add_kv_row(mtm, &hw_view, 336.0, 44.0, "Memory", &format_memory_mb(vm.memory_mb));
+        let cpu_desc = if vm.enable_nested_virt {
+            format!("{} vCPUs (Native + Nested KVM)", vm.cpus)
+        } else {
+            format!("{} vCPUs (Apple Silicon Native)", vm.cpus)
+        };
+        let ram_desc = if vm.auto_reclaim_ram {
+            format!("{} (Auto-Reclaim On)", format_memory_mb(vm.memory_mb))
+        } else {
+            format_memory_mb(vm.memory_mb)
+        };
+        add_kv_row(mtm, &hw_view, 16.0, 44.0, "Processors", &cpu_desc);
+        add_kv_row(mtm, &hw_view, 336.0, 44.0, "Memory", &ram_desc);
         add_kv_row(
             mtm,
             &hw_view,
@@ -645,12 +722,13 @@ impl ManagerApp {
             336.0,
             70.0,
             "Disk I/O",
-            if vm.fast_disk_io {
-                "Fast (Uncached + Fsync)"
-            } else {
-                "Strict (Full Sync)"
-            },
+            vm.disk_io_mode.label(),
         );
+        let audio_desc = match (vm.enable_audio, vm.enable_mic) {
+            (true, true) => "Speakers + Mic",
+            (true, false) => "Speakers",
+            (false, _) => "Off",
+        };
         add_kv_row(
             mtm,
             &hw_view,
@@ -658,8 +736,8 @@ impl ManagerApp {
             96.0,
             "Audio / Clip",
             &format!(
-                "Audio {} · Clipboard {}",
-                if vm.enable_audio { "On" } else { "Off" },
+                "{} · Clip {}",
+                audio_desc,
                 if vm.enable_clipboard { "On" } else { "Off" }
             ),
         );
@@ -1018,6 +1096,7 @@ fn state_color(state: VmState) -> Retained<NSColor> {
     match state {
         VmState::Running => NSColor::systemGreenColor(),
         VmState::Paused => NSColor::systemOrangeColor(),
+        VmState::Saving | VmState::Restoring => NSColor::systemPurpleColor(),
         VmState::Starting | VmState::Resuming | VmState::Pausing | VmState::Stopping => {
             NSColor::systemBlueColor()
         }

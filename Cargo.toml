@@ -1,6 +1,6 @@
 [package]
 name = "rustvm"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 description = "A simple, native macOS VirtualBox-like Linux virtual machine manager written in Rust using Apple Virtualization.framework"
 
@@ -99,6 +99,8 @@ objc2-virtualization = { version = "0.3", features = [
     "VZHostAudioOutputStreamSink",
     "VZKeyboardConfiguration",
     "VZLinuxBootLoader",
+    "VZLinuxRosettaAbstractSocketCachingOptions",
+    "VZLinuxRosettaCachingOptions",
     "VZLinuxRosettaDirectoryShare",
     "VZMACAddress",
     "VZMemoryBalloonDevice",

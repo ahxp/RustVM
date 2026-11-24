@@ -1,20 +1,23 @@
 use anyhow::Result;
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertStyle,
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSBox, NSButton, NSColor, NSScrollView,
-    NSTextField, NSTextView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSAlertThirdButtonReturn, NSAutoresizingMaskOptions, NSBackingStoreType, NSBox, NSButton,
+    NSColor, NSScreen, NSScrollView, NSTextField, NSTextView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
-use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString};
+use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString, NSTimer};
 use objc2_virtualization::VZVirtualMachineView;
 use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::rc::Rc;
 
-use crate::config::{VmConfig, VmStore, format_memory_mb};
+use crate::config::{DiskIoMode, VmConfig, VmStore, format_memory_mb};
 use crate::gui::widgets::{
     self, FlippedView, TargetStore, pick_iso_file, rect, show_error_alert, size,
 };
@@ -26,6 +29,9 @@ struct DisplayWindowDelegateIvars {
     on_should_close: RefCell<Box<dyn Fn() -> bool>>,
     on_will_close: RefCell<Box<dyn Fn()>>,
     on_resize: RefCell<Box<dyn Fn()>>,
+    on_minimize: RefCell<Box<dyn Fn()>>,
+    on_resign_key: RefCell<Box<dyn Fn()>>,
+    on_become_key: RefCell<Box<dyn Fn()>>,
 }
 
 define_class!(
@@ -61,25 +67,49 @@ define_class!(
         fn window_did_exit_full_screen(&self, _notification: &NSNotification) {
             (self.ivars().on_resize.borrow())();
         }
+
+        #[unsafe(method(windowDidMiniaturize:))]
+        fn window_did_miniaturize(&self, _notification: &NSNotification) {
+            (self.ivars().on_minimize.borrow())();
+        }
+
+        #[unsafe(method(windowDidResignKey:))]
+        fn window_did_resign_key(&self, _notification: &NSNotification) {
+            (self.ivars().on_resign_key.borrow())();
+        }
+
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn window_did_become_key(&self, _notification: &NSNotification) {
+            (self.ivars().on_become_key.borrow())();
+        }
     }
 );
 
 impl DisplayWindowDelegate {
-    fn new<F, G, H>(
+    fn new<F, G, H, M, R, B>(
         mtm: MainThreadMarker,
         on_should_close: F,
         on_will_close: G,
         on_resize: H,
+        on_minimize: M,
+        on_resign_key: R,
+        on_become_key: B,
     ) -> Retained<Self>
     where
         F: Fn() -> bool + 'static,
         G: Fn() + 'static,
         H: Fn() + 'static,
+        M: Fn() + 'static,
+        R: Fn() + 'static,
+        B: Fn() + 'static,
     {
         let this = mtm.alloc::<Self>().set_ivars(DisplayWindowDelegateIvars {
             on_should_close: RefCell::new(Box::new(on_should_close)),
             on_will_close: RefCell::new(Box::new(on_will_close)),
             on_resize: RefCell::new(Box::new(on_resize)),
+            on_minimize: RefCell::new(Box::new(on_minimize)),
+            on_resign_key: RefCell::new(Box::new(on_resign_key)),
+            on_become_key: RefCell::new(Box::new(on_become_key)),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -90,6 +120,7 @@ struct DisplayControls {
     status_dot: Retained<NSBox>,
     status_label: Retained<NSTextField>,
     pause_btn: Retained<NSButton>,
+    save_btn: Retained<NSButton>,
     shutdown_btn: Retained<NSButton>,
     stop_btn: Retained<NSButton>,
     iso_btn: Retained<NSButton>,
@@ -98,15 +129,27 @@ struct DisplayControls {
     vm_name: String,
     vm_cpus: usize,
     vm_memory_mb: u64,
-    fast_disk_io: bool,
+    disk_io_mode: DiskIoMode,
+    can_save_state: Cell<bool>,
     shared_folder: Option<PathBuf>,
     hidpi_mode: Cell<bool>,
     current_iso: RefCell<Option<PathBuf>>,
     current_state: Cell<VmState>,
     log_window: RefCell<Option<Retained<NSWindow>>>,
+    idle_reclaim_timer: RefCell<Option<Retained<NSTimer>>>,
+    boot_sync_timers: RefCell<Vec<Retained<NSTimer>>>,
 }
 
 impl DisplayControls {
+    fn cancel_timers(&self) {
+        if let Some(t) = self.idle_reclaim_timer.borrow_mut().take() {
+            t.invalidate();
+        }
+        for t in self.boot_sync_timers.borrow_mut().drain(..) {
+            t.invalidate();
+        }
+    }
+
     fn update_state(&self, state: VmState) {
         self.current_state.set(state);
         self.window.setTitle(&NSString::from_str(&format!(
@@ -119,6 +162,7 @@ impl DisplayControls {
         let dot_color = match state {
             VmState::Running => NSColor::systemGreenColor(),
             VmState::Paused => NSColor::systemOrangeColor(),
+            VmState::Saving | VmState::Restoring => NSColor::systemPurpleColor(),
             VmState::Starting | VmState::Resuming | VmState::Pausing | VmState::Stopping => {
                 NSColor::systemBlueColor()
             }
@@ -131,6 +175,7 @@ impl DisplayControls {
             VmState::Running => {
                 self.pause_btn.setTitle(&NSString::from_str("Pause"));
                 self.pause_btn.setEnabled(true);
+                self.save_btn.setEnabled(self.can_save_state.get());
                 self.shutdown_btn.setEnabled(true);
                 self.stop_btn.setEnabled(true);
                 self.iso_btn.setEnabled(true);
@@ -139,21 +184,29 @@ impl DisplayControls {
             VmState::Paused => {
                 self.pause_btn.setTitle(&NSString::from_str("Resume"));
                 self.pause_btn.setEnabled(true);
+                self.save_btn.setEnabled(self.can_save_state.get());
                 self.shutdown_btn.setEnabled(false);
                 self.stop_btn.setEnabled(true);
                 self.iso_btn.setEnabled(false);
                 self.reclaim_btn.setEnabled(false);
             }
-            VmState::Starting | VmState::Resuming | VmState::Pausing | VmState::Stopping => {
+            VmState::Starting
+            | VmState::Resuming
+            | VmState::Pausing
+            | VmState::Saving
+            | VmState::Restoring
+            | VmState::Stopping => {
                 self.pause_btn.setEnabled(false);
+                self.save_btn.setEnabled(false);
                 self.shutdown_btn.setEnabled(false);
-                self.stop_btn.setEnabled(true);
+                self.stop_btn.setEnabled(!matches!(state, VmState::Saving | VmState::Restoring));
                 self.iso_btn.setEnabled(false);
                 self.reclaim_btn.setEnabled(false);
             }
             VmState::Stopped | VmState::Error => {
                 self.pause_btn.setTitle(&NSString::from_str("Pause"));
                 self.pause_btn.setEnabled(false);
+                self.save_btn.setEnabled(false);
                 self.shutdown_btn.setEnabled(false);
                 self.stop_btn.setEnabled(false);
                 self.iso_btn.setEnabled(false);
@@ -183,12 +236,7 @@ impl DisplayControls {
         let display_mode = if self.hidpi_mode.get() {
             "HiDPI 2×"
         } else {
-            "Smooth 1×"
-        };
-        let disk_mode = if self.fast_disk_io {
-            "Fast Disk"
-        } else {
-            "Strict Disk"
+            "Smooth 1× (1:1)"
         };
         let share_desc = if self.shared_folder.is_some() {
             " · Shared: virtiofs"
@@ -200,7 +248,7 @@ impl DisplayControls {
             self.vm_cpus,
             format_memory_mb(self.vm_memory_mb),
             display_mode,
-            disk_mode,
+            self.disk_io_mode.short_label(),
             iso_desc,
             share_desc
         )));
@@ -211,6 +259,7 @@ pub struct VmDisplaySession {
     window: Retained<NSWindow>,
     runner: Rc<RefCell<VmRunner>>,
     controls: Rc<DisplayControls>,
+    saved_state_path: PathBuf,
     _delegate: Retained<DisplayWindowDelegate>,
     _targets: TargetStore,
 }
@@ -227,8 +276,24 @@ impl VmDisplaySession {
         F: Fn(VmState) + 'static,
         G: Fn() + 'static,
     {
-        let width = (cfg.display_width as f64).clamp(960.0, 1360.0);
-        let height = (cfg.display_height as f64).clamp(620.0, 820.0) + 72.0;
+        let toolbar_h = 46.0;
+        let footer_h = 26.0;
+
+        // Size the window cleanly for exact 1:1 pixel mapping inside the current macOS screen
+        let (max_view_w, max_view_h) = NSScreen::mainScreen(mtm)
+            .map(|s| {
+                let vf = s.visibleFrame();
+                (
+                    (vf.size.width - 40.0).max(960.0),
+                    (vf.size.height - toolbar_h - footer_h - 48.0).max(600.0),
+                )
+            })
+            .unwrap_or((1440.0, 900.0));
+
+        let view_w = (cfg.display_width as f64).clamp(960.0, max_view_w);
+        let view_h = (cfg.display_height as f64).clamp(600.0, max_view_h);
+        let width = view_w;
+        let height = view_h + toolbar_h + footer_h;
 
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
@@ -237,7 +302,7 @@ impl VmDisplaySession {
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 mtm.alloc(),
-                rect(100.0, 80.0, width, height),
+                rect(80.0, 60.0, width, height),
                 style,
                 NSBackingStoreType::Buffered,
                 false,
@@ -246,7 +311,7 @@ impl VmDisplaySession {
         unsafe {
             window.setReleasedWhenClosed(false);
         }
-        window.setMinSize(size(880.0, 560.0));
+        window.setMinSize(size(940.0, 560.0));
         window.setTitle(&NSString::from_str(&format!(
             "RustVM — {} [Starting…]",
             cfg.name
@@ -259,10 +324,6 @@ impl VmDisplaySession {
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
 
-        let toolbar_h = 46.0;
-        let footer_h = 26.0;
-
-        // Top toolbar container
         let toolbar = FlippedView::new(mtm, rect(0.0, 0.0, width, toolbar_h));
         toolbar.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
@@ -275,9 +336,6 @@ impl VmDisplaySession {
         );
         root.addSubview(&top_sep);
 
-        // VZVirtualMachineView:
-        // In Smooth 1x mode (default), we disable Apple's Retina 2x auto-reconfigure so
-        // software Virtio-GPU renders 4x fewer pixels and feels dramatically smoother.
         let vm_view_rect = rect(0.0, toolbar_h, width, height - toolbar_h - footer_h);
         let vm_view = unsafe {
             let v = VZVirtualMachineView::initWithFrame(mtm.alloc(), vm_view_rect);
@@ -315,23 +373,30 @@ impl VmDisplaySession {
         toolbar.addSubview(&status_dot);
 
         let status_label =
-            widgets::semibold_label(mtm, rect(28.0, 14.0, 74.0, 18.0), "Starting…", 12.0);
+            widgets::semibold_label(mtm, rect(28.0, 14.0, 72.0, 18.0), "Starting…", 12.0);
         toolbar.addSubview(&status_label);
 
         let pause_btn =
-            widgets::push_button(mtm, rect(104.0, 9.0, 70.0, 28.0), "Pause", &mut targets, || {});
+            widgets::push_button(mtm, rect(102.0, 9.0, 66.0, 28.0), "Pause", &mut targets, || {});
+        let save_btn = widgets::push_button(
+            mtm,
+            rect(172.0, 9.0, 94.0, 28.0),
+            "Save & Close",
+            &mut targets,
+            || {},
+        );
         let shutdown_btn = widgets::push_button(
             mtm,
-            rect(178.0, 9.0, 84.0, 28.0),
+            rect(270.0, 9.0, 80.0, 28.0),
             "Shutdown",
             &mut targets,
             || {},
         );
         let stop_btn =
-            widgets::push_button(mtm, rect(266.0, 9.0, 84.0, 28.0), "Force Stop", &mut targets, || {});
+            widgets::push_button(mtm, rect(354.0, 9.0, 56.0, 28.0), "Stop", &mut targets, || {});
         let iso_btn = widgets::push_button(
             mtm,
-            rect(356.0, 9.0, 94.0, 28.0),
+            rect(416.0, 9.0, 90.0, 28.0),
             if cfg.iso_path.is_some() {
                 "Eject ISO"
             } else {
@@ -342,14 +407,14 @@ impl VmDisplaySession {
         );
         let reclaim_btn = widgets::push_button(
             mtm,
-            rect(456.0, 9.0, 84.0, 28.0),
+            rect(510.0, 9.0, 80.0, 28.0),
             "Free RAM",
             &mut targets,
             || {},
         );
         let log_btn = widgets::push_button(
             mtm,
-            rect(546.0, 9.0, 80.0, 28.0),
+            rect(594.0, 9.0, 74.0, 28.0),
             "Serial Log",
             &mut targets,
             || {},
@@ -357,7 +422,7 @@ impl VmDisplaySession {
 
         let hidpi_cb = widgets::checkbox(
             mtm,
-            rect(636.0, 13.0, 92.0, 20.0),
+            rect(678.0, 13.0, 88.0, 20.0),
             "HiDPI (2×)",
             cfg.hidpi_display,
             &mut targets,
@@ -367,7 +432,7 @@ impl VmDisplaySession {
         let vm_view_for_keys = vm_view.clone();
         let keys_cb = widgets::checkbox(
             mtm,
-            rect(734.0, 13.0, 128.0, 20.0),
+            rect(770.0, 13.0, 114.0, 20.0),
             "Capture Keys",
             true,
             &mut targets,
@@ -377,6 +442,7 @@ impl VmDisplaySession {
         );
 
         toolbar.addSubview(&pause_btn);
+        toolbar.addSubview(&save_btn);
         toolbar.addSubview(&shutdown_btn);
         toolbar.addSubview(&stop_btn);
         toolbar.addSubview(&iso_btn);
@@ -387,11 +453,16 @@ impl VmDisplaySession {
 
         window.setContentView(Some(&root));
 
+        let serial_log_path = store.serial_log_path(&cfg.id);
+        let saved_state_path = store.saved_state_path(&cfg.id);
+        let serial = SerialBridge::new_log_only(&serial_log_path)?;
+
         let controls = Rc::new(DisplayControls {
             window: window.clone(),
             status_dot,
             status_label,
             pause_btn: pause_btn.clone(),
+            save_btn: save_btn.clone(),
             shutdown_btn: shutdown_btn.clone(),
             stop_btn: stop_btn.clone(),
             iso_btn: iso_btn.clone(),
@@ -400,33 +471,54 @@ impl VmDisplaySession {
             vm_name: cfg.name.clone(),
             vm_cpus: cfg.cpus,
             vm_memory_mb: cfg.memory_mb,
-            fast_disk_io: cfg.fast_disk_io,
+            disk_io_mode: cfg.disk_io_mode,
+            can_save_state: Cell::new(false),
             shared_folder: cfg.shared_folder.clone(),
             hidpi_mode: Cell::new(cfg.hidpi_display),
             current_iso: RefCell::new(cfg.iso_path.clone()),
             current_state: Cell::new(VmState::Starting),
             log_window: RefCell::new(None),
+            idle_reclaim_timer: RefCell::new(None),
+            boot_sync_timers: RefCell::new(Vec::new()),
         });
-        controls.refresh_iso_and_footer();
-
-        let serial_log_path = store.serial_log_path(&cfg.id);
-        let serial = SerialBridge::new_log_only(&serial_log_path)?;
 
         let controls_ev = Rc::clone(&controls);
         let vm_id_for_iso = cfg.id.clone();
         let on_state_rc = Rc::new(on_state_change);
         let on_state_ev = Rc::clone(&on_state_rc);
+        let sync_cb_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        let sync_slot_ev = Rc::clone(&sync_cb_slot);
 
         let runner = VmRunner::new(store, cfg, serial, false, move |event| match event {
             VmEvent::StateChanged(st) => {
                 controls_ev.update_state(st);
                 on_state_ev(st);
+                if st == VmState::Running && !controls_ev.hidpi_mode.get() {
+                    // Auto-sync 1:1 Smooth 1x resolution shortly after boot so Linux DRM picks it up cleanly
+                    if let Some(sync_fn) = sync_slot_ev.borrow().clone() {
+                        sync_fn();
+                        for delay in [1.5_f64, 4.5_f64] {
+                            let s = Rc::clone(&sync_fn);
+                            let blk = RcBlock::new(move |_t: NonNull<NSTimer>| {
+                                s();
+                            });
+                            let t = unsafe {
+                                NSTimer::scheduledTimerWithTimeInterval_repeats_block(
+                                    delay, false, &blk,
+                                )
+                            };
+                            controls_ev.boot_sync_timers.borrow_mut().push(t);
+                        }
+                    }
+                }
             }
             VmEvent::GuestStopped => {
+                controls_ev.cancel_timers();
                 controls_ev.update_state(VmState::Stopped);
                 on_state_ev(VmState::Stopped);
             }
             VmEvent::StoppedWithError(msg) => {
+                controls_ev.cancel_timers();
                 controls_ev.update_state(VmState::Error);
                 on_state_ev(VmState::Error);
                 show_error_alert(mtm, "Virtual Machine Stopped", &msg);
@@ -445,13 +537,26 @@ impl VmDisplaySession {
             }
         })?;
 
+        let can_save = runner.can_save_state();
+        controls.can_save_state.set(can_save);
+        if let Some(reason) = runner.save_restore_unsupported_reason() {
+            save_btn.setToolTip(Some(&NSString::from_str(&format!(
+                "Save State unavailable for this configuration: {reason}"
+            ))));
+        } else {
+            save_btn.setToolTip(Some(&NSString::from_str(
+                "Freeze VM state to disk for ~1-2s instant resume and 0 MB RAM while closed",
+            )));
+        }
+        save_btn.setEnabled(false);
+        controls.refresh_iso_and_footer();
+
         unsafe {
             vm_view.setVirtualMachine(Some(runner.vz_vm()));
         }
 
         let runner = Rc::new(RefCell::new(runner));
 
-        // Helper closure to sync Smooth 1x resolution to the current logical view size
         let sync_1x_resolution: Rc<dyn Fn()> = {
             let r = Rc::clone(&runner);
             let c = Rc::clone(&controls);
@@ -469,8 +574,26 @@ impl VmDisplaySession {
                 r.borrow().reconfigure_display(w, h);
             })
         };
+        *sync_cb_slot.borrow_mut() = Some(Rc::clone(&sync_1x_resolution));
 
-        // Bind real toolbar button actions
+        let trigger_save_and_close: Rc<dyn Fn()> = {
+            let r = Rc::clone(&runner);
+            let win = window.clone();
+            let sp = saved_state_path.clone();
+            Rc::new(move || {
+                let win_done = win.clone();
+                r.borrow().save_state_and_stop(&sp, move |res| match res {
+                    Ok(()) => {
+                        win_done.close();
+                    }
+                    Err(msg) => {
+                        show_error_alert(mtm, "Save State Failed", &msg);
+                    }
+                });
+            })
+        };
+
+        // Bind toolbar actions
         {
             let r = Rc::clone(&runner);
             targets.bind_click(mtm, &pause_btn, move || {
@@ -479,6 +602,20 @@ impl VmDisplaySession {
                     runner.pause();
                 } else if runner.can_resume() {
                     runner.resume();
+                }
+            });
+        }
+        {
+            let save_fn = Rc::clone(&trigger_save_and_close);
+            targets.bind_click(mtm, &save_btn, move || {
+                if can_save {
+                    save_fn();
+                } else {
+                    show_error_alert(
+                        mtm,
+                        "Save State Unavailable",
+                        "This VM configuration does not support saving machine state (e.g., an attached USB ISO or unsupported device).",
+                    );
                 }
             });
         }
@@ -556,15 +693,23 @@ impl VmDisplaySession {
             });
         }
 
-        // Window delegate: prompt before killing running VM, sync 1x display on resize, clean up on close
         let r_close = Rc::clone(&runner);
         let c_close = Rc::clone(&controls);
         let vm_name_close = cfg.name.clone();
+        let save_on_close = Rc::clone(&trigger_save_and_close);
         let on_closed_rc = Rc::new(on_closed);
         let on_closed_cb = Rc::clone(&on_closed_rc);
         let r_will_close = Rc::clone(&runner);
-        let on_state_close = Rc::clone(&on_state_rc);
+        let c_will_close = Rc::clone(&controls);
         let on_resize = Rc::clone(&sync_1x_resolution);
+
+        // Auto-reclaim idle RAM when minimized or unfocused
+        let auto_reclaim = cfg.auto_reclaim_ram;
+        let r_min = Rc::clone(&runner);
+        let c_min = Rc::clone(&controls);
+        let r_resign = Rc::clone(&runner);
+        let c_resign = Rc::clone(&controls);
+        let c_become = Rc::clone(&controls);
 
         let delegate = DisplayWindowDelegate::new(
             mtm,
@@ -573,50 +718,106 @@ impl VmDisplaySession {
                 if !st.is_active() {
                     return true;
                 }
+                if matches!(st, VmState::Saving | VmState::Restoring) {
+                    return false;
+                }
                 let alert = NSAlert::new(mtm);
                 alert.setAlertStyle(NSAlertStyle::Warning);
                 alert.setMessageText(&NSString::from_str(&format!(
                     "Close '{}'?",
                     vm_name_close
                 )));
-                alert.setInformativeText(&NSString::from_str(
-                    "This virtual machine is still running. You can send a graceful shutdown signal or force power it off.",
-                ));
-                alert.addButtonWithTitle(&NSString::from_str("Force Power Off"));
-                alert.addButtonWithTitle(&NSString::from_str("Graceful Shutdown"));
-                alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-                let resp = alert.runModal();
-                if resp == NSAlertFirstButtonReturn {
-                    r_close.borrow().force_stop();
-                    true
-                } else if resp == NSAlertSecondButtonReturn {
-                    r_close.borrow().request_stop();
-                    false
+                if can_save {
+                    alert.setInformativeText(&NSString::from_str(
+                        "Save State freezes Linux to disk (0 MB RAM while closed, ~1-2s instant resume). Or shut down / power off.",
+                    ));
+                    alert.addButtonWithTitle(&NSString::from_str("Save State & Close"));
+                    alert.addButtonWithTitle(&NSString::from_str("Force Power Off"));
+                    alert.addButtonWithTitle(&NSString::from_str("Graceful Shutdown"));
+                    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+                    let resp = alert.runModal();
+                    if resp == NSAlertFirstButtonReturn {
+                        save_on_close();
+                        false
+                    } else if resp == NSAlertSecondButtonReturn {
+                        r_close.borrow().force_stop();
+                        true
+                    } else if resp == NSAlertThirdButtonReturn {
+                        r_close.borrow().request_stop();
+                        false
+                    } else {
+                        false
+                    }
                 } else {
-                    false
+                    alert.setInformativeText(&NSString::from_str(
+                        "This virtual machine is still running. You can send a graceful shutdown signal or force power it off.",
+                    ));
+                    alert.addButtonWithTitle(&NSString::from_str("Force Power Off"));
+                    alert.addButtonWithTitle(&NSString::from_str("Graceful Shutdown"));
+                    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+                    let resp = alert.runModal();
+                    if resp == NSAlertFirstButtonReturn {
+                        r_close.borrow().force_stop();
+                        true
+                    } else if resp == NSAlertSecondButtonReturn {
+                        r_close.borrow().request_stop();
+                        false
+                    } else {
+                        false
+                    }
                 }
             },
             move || {
+                c_will_close.cancel_timers();
                 if r_will_close.borrow().state().is_active() {
                     r_will_close.borrow().force_stop();
                 }
                 r_will_close.borrow_mut().shutdown_serial();
-                on_state_close(VmState::Stopped);
                 on_closed_cb();
             },
             move || {
                 on_resize();
             },
+            move || {
+                if auto_reclaim && c_min.current_state.get() == VmState::Running {
+                    let _ = r_min.borrow().reclaim_idle_memory(|| {});
+                }
+            },
+            move || {
+                if !auto_reclaim || c_resign.current_state.get() != VmState::Running {
+                    return;
+                }
+                if let Some(prev) = c_resign.idle_reclaim_timer.borrow_mut().take() {
+                    prev.invalidate();
+                }
+                let r_idle = Rc::clone(&r_resign);
+                let c_idle = Rc::clone(&c_resign);
+                let blk = RcBlock::new(move |_t: NonNull<NSTimer>| {
+                    if c_idle.current_state.get() == VmState::Running {
+                        let _ = r_idle.borrow().reclaim_idle_memory(|| {});
+                    }
+                });
+                let timer = unsafe {
+                    NSTimer::scheduledTimerWithTimeInterval_repeats_block(45.0, false, &blk)
+                };
+                *c_resign.idle_reclaim_timer.borrow_mut() = Some(timer);
+            },
+            move || {
+                if let Some(t) = c_become.idle_reclaim_timer.borrow_mut().take() {
+                    t.invalidate();
+                }
+            },
         );
         window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
         window.makeKeyAndOrderFront(None);
-        runner.borrow().start();
+        runner.borrow().start_or_restore(&saved_state_path);
 
         Ok(Self {
             window,
             runner,
             controls,
+            saved_state_path,
             _delegate: delegate,
             _targets: targets,
         })
@@ -628,6 +829,21 @@ impl VmDisplaySession {
 
     pub fn state(&self) -> VmState {
         self.controls.current_state.get()
+    }
+
+    pub fn can_save_state(&self) -> bool {
+        self.runner.borrow().can_save_state()
+    }
+
+    pub fn save_state_and_close(&self) {
+        let win = self.window.clone();
+        self.runner
+            .borrow()
+            .save_state_and_stop(&self.saved_state_path, move |res| {
+                if res.is_ok() {
+                    win.close();
+                }
+            });
     }
 
     pub fn pause_or_resume(&self) {

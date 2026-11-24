@@ -15,9 +15,10 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 use crate::config::{VmConfig, VmStore};
-use crate::vm::config_builder::{build_usb_iso_config, build_vz_configuration};
+use crate::vm::config_builder::{build_usb_iso_config, build_vz_configuration, file_url};
 use crate::vm::console::SerialBridge;
 use crate::vm::{VmEvent, VmState, is_virtualization_supported};
+use std::fs;
 
 type EventCallback = Rc<RefCell<Box<dyn FnMut(VmEvent)>>>;
 
@@ -59,6 +60,7 @@ pub struct VmRunner {
     serial: SerialBridge,
     on_event: EventCallback,
     configured_memory_bytes: u64,
+    save_restore_support: Result<(), String>,
     balloon_restore_timer: RefCell<Option<Retained<NSTimer>>>,
 }
 
@@ -83,6 +85,11 @@ impl VmRunner {
         let delegate = RustVmDelegate::new(Rc::clone(&on_event));
 
         let configured_memory_bytes = unsafe { vz_config.memorySize() };
+        let save_restore_support = unsafe {
+            vz_config
+                .validateSaveRestoreSupportWithError()
+                .map_err(|e| e.localizedDescription().to_string())
+        };
         let vm = unsafe {
             let vm = VZVirtualMachine::initWithConfiguration(
                 VZVirtualMachine::alloc(),
@@ -99,6 +106,7 @@ impl VmRunner {
             serial,
             on_event,
             configured_memory_bytes,
+            save_restore_support,
             balloon_restore_timer: RefCell::new(None),
         })
     }
@@ -126,6 +134,152 @@ impl VmRunner {
 
     pub fn can_stop(&self) -> bool {
         unsafe { self.vm.canStop() }
+    }
+
+    pub fn can_save_state(&self) -> bool {
+        self.save_restore_support.is_ok()
+    }
+
+    pub fn save_restore_unsupported_reason(&self) -> Option<&str> {
+        self.save_restore_support.as_ref().err().map(String::as_str)
+    }
+
+    /// Starts the VM — or instantly restores it if a saved state snapshot exists and is compatible.
+    pub fn start_or_restore(&self, saved_state_path: &Path) {
+        if saved_state_path.is_file() && self.can_save_state() {
+            if let Ok(url) = file_url(saved_state_path) {
+                let cb = Rc::clone(&self.on_event);
+                let vm_clone = self.vm.clone();
+                let state_path = saved_state_path.to_path_buf();
+                (cb.borrow_mut())(VmEvent::StateChanged(VmState::Restoring));
+
+                let block = RcBlock::new(move |err: *mut NSError| {
+                    let _ = fs::remove_file(&state_path);
+                    if unsafe { err.as_ref() }.is_some() {
+                        // Snapshot incompatible (e.g., macOS update or config edit) — fall back to clean boot
+                        let cb2 = Rc::clone(&cb);
+                        (cb2.borrow_mut())(VmEvent::StateChanged(VmState::Starting));
+                        let start_blk = RcBlock::new(move |start_err: *mut NSError| {
+                            if let Some(e) = unsafe { start_err.as_ref() } {
+                                (cb2.borrow_mut())(VmEvent::ActionError(format!(
+                                    "Failed to start VM: {}",
+                                    e.localizedDescription()
+                                )));
+                                (cb2.borrow_mut())(VmEvent::StateChanged(VmState::Stopped));
+                            } else {
+                                (cb2.borrow_mut())(VmEvent::StateChanged(VmState::Running));
+                            }
+                        });
+                        unsafe {
+                            vm_clone.startWithCompletionHandler(&start_blk);
+                        }
+                    } else {
+                        // Restore succeeded (VM is now Paused) -> immediately resume!
+                        let cb2 = Rc::clone(&cb);
+                        (cb2.borrow_mut())(VmEvent::StateChanged(VmState::Resuming));
+                        let resume_blk = RcBlock::new(move |res_err: *mut NSError| {
+                            if let Some(e) = unsafe { res_err.as_ref() } {
+                                (cb2.borrow_mut())(VmEvent::ActionError(format!(
+                                    "Failed to resume restored VM: {}",
+                                    e.localizedDescription()
+                                )));
+                                (cb2.borrow_mut())(VmEvent::StateChanged(VmState::Paused));
+                            } else {
+                                (cb2.borrow_mut())(VmEvent::StateChanged(VmState::Running));
+                            }
+                        });
+                        unsafe {
+                            vm_clone.resumeWithCompletionHandler(&resume_blk);
+                        }
+                    }
+                });
+
+                unsafe {
+                    self.vm.restoreMachineStateFromURL_completionHandler(&url, &block);
+                }
+                return;
+            }
+        }
+        self.start();
+    }
+
+    /// Pauses (if running), saves complete VM memory & CPU state to disk, and powers off to free 100% of host RAM.
+    pub fn save_state_and_stop<F>(&self, saved_state_path: &Path, on_done: F)
+    where
+        F: Fn(Result<(), String>) + 'static,
+    {
+        if let Err(ref reason) = self.save_restore_support {
+            on_done(Err(format!(
+                "Save State is not supported for this VM configuration: {reason}"
+            )));
+            return;
+        }
+        let tmp_path = saved_state_path.with_extension("vzsave.tmp");
+        let _ = fs::remove_file(&tmp_path);
+        let Ok(tmp_url) = file_url(&tmp_path) else {
+            on_done(Err("Invalid save state file path".into()));
+            return;
+        };
+
+        let final_path = saved_state_path.to_path_buf();
+        let cb = Rc::clone(&self.on_event);
+        let vm = self.vm.clone();
+        let on_done = Rc::new(on_done);
+        (cb.borrow_mut())(VmEvent::StateChanged(VmState::Saving));
+
+        let run_save = Rc::new(move || {
+            let cb_save = Rc::clone(&cb);
+            let vm_save = vm.clone();
+            let done_save = Rc::clone(&on_done);
+            let tmp_p = tmp_path.clone();
+            let fin_p = final_path.clone();
+            let save_block = RcBlock::new(move |err: *mut NSError| {
+                if let Some(e) = unsafe { err.as_ref() } {
+                    let _ = fs::remove_file(&tmp_p);
+                    let msg = format!("Failed to save VM state: {}", e.localizedDescription());
+                    (cb_save.borrow_mut())(VmEvent::StateChanged(VmState::Paused));
+                    (done_save)(Err(msg));
+                } else {
+                    if let Err(io_err) = fs::rename(&tmp_p, &fin_p) {
+                        let _ = fs::remove_file(&tmp_p);
+                        (cb_save.borrow_mut())(VmEvent::StateChanged(VmState::Paused));
+                        (done_save)(Err(format!("Failed to finalize saved state: {io_err}")));
+                        return;
+                    }
+                    let cb_stop = Rc::clone(&cb_save);
+                    let done_stop = Rc::clone(&done_save);
+                    let stop_block = RcBlock::new(move |_stop_err: *mut NSError| {
+                        (cb_stop.borrow_mut())(VmEvent::GuestStopped);
+                        (done_stop)(Ok(()));
+                    });
+                    unsafe {
+                        vm_save.stopWithCompletionHandler(&stop_block);
+                    }
+                }
+            });
+            unsafe {
+                vm.saveMachineStateToURL_completionHandler(&tmp_url, &save_block);
+            }
+        });
+
+        if self.can_pause() {
+            let save_after_pause = Rc::clone(&run_save);
+            let cb_pause = Rc::clone(&self.on_event);
+            let pause_block = RcBlock::new(move |err: *mut NSError| {
+                if let Some(e) = unsafe { err.as_ref() } {
+                    let msg = format!("Failed to pause VM before saving: {}", e.localizedDescription());
+                    (cb_pause.borrow_mut())(VmEvent::ActionError(msg));
+                    (cb_pause.borrow_mut())(VmEvent::StateChanged(VmState::Running));
+                } else {
+                    (save_after_pause)();
+                }
+            });
+            unsafe {
+                self.vm.pauseWithCompletionHandler(&pause_block);
+            }
+        } else if self.state() == VmState::Paused {
+            (run_save)();
+        }
     }
 
     pub fn start(&self) {
