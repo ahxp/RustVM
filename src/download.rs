@@ -53,7 +53,7 @@ where
     let agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(20)))
         .timeout_recv_body(None)
-        .user_agent("RustVM/1.1.1")
+        .user_agent("RustVM/1.1.2")
         .build()
         .new_agent();
 

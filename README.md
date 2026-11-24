@@ -46,7 +46,7 @@ To also install `RustVM.app` into `~/Applications`:
 ./setup.sh --install-app
 ```
 
-To package a distributable macOS `.dmg` installer (`dist/RustVM-1.1.1-arm64.dmg`):
+To package a distributable macOS `.dmg` installer (`dist/RustVM-1.1.2-arm64.dmg`):
 
 ```bash
 ./build-dmg.sh

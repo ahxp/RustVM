@@ -451,8 +451,8 @@ impl VmWizardWindow {
         }
         y += 34.0;
 
-        // 5b. Display Scale dropdown
-        root.addSubview(&widgets::semibold_label(mtm, rect(lbl_x, y + 4.0, 120.0, 18.0), "Display Scale:", 13.0));
+        // 5b. HiDPI / Display Scale dropdown
+        root.addSubview(&widgets::semibold_label(mtm, rect(lbl_x, y + 4.0, 120.0, 18.0), "HiDPI Scale:", 13.0));
         {
             let sv = Rc::clone(&scale_val);
             let scale_modes = [
