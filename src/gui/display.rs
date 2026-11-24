@@ -219,12 +219,16 @@ struct DisplayControls {
     current_state: Cell<VmState>,
     log_window: RefCell<Option<Retained<NSWindow>>>,
     idle_reclaim_timer: RefCell<Option<Retained<NSTimer>>>,
+    resize_debounce_timer: RefCell<Option<Retained<NSTimer>>>,
     sync_timers: RefCell<Vec<Retained<NSTimer>>>,
 }
 
 impl DisplayControls {
     fn cancel_timers(&self) {
         if let Some(t) = self.idle_reclaim_timer.borrow_mut().take() {
+            t.invalidate();
+        }
+        if let Some(t) = self.resize_debounce_timer.borrow_mut().take() {
             t.invalidate();
         }
         for t in self.sync_timers.borrow_mut().drain(..) {
@@ -651,6 +655,7 @@ impl VmDisplaySession {
             current_state: Cell::new(VmState::Starting),
             log_window: RefCell::new(None),
             idle_reclaim_timer: RefCell::new(None),
+            resize_debounce_timer: RefCell::new(None),
             sync_timers: RefCell::new(Vec::new()),
         });
 
@@ -917,6 +922,7 @@ impl VmDisplaySession {
         let c_will_close = Rc::clone(&controls);
 
         let c_layout = Rc::clone(&controls);
+        let sync_on_resize = Rc::clone(&sync_display_resolution);
         let on_end_resize = Rc::clone(&schedule_sync_pulse);
         let c_will_enter_fs = Rc::clone(&controls);
         let c_did_enter_fs = Rc::clone(&controls);
@@ -999,6 +1005,19 @@ impl VmDisplaySession {
             },
             move || {
                 c_layout.relayout();
+                // Debounced 200ms display sync so maximizing, zooming, or tiling also updates Linux resolution
+                if let Some(prev) = c_layout.resize_debounce_timer.borrow_mut().take() {
+                    prev.invalidate();
+                }
+                let s = Rc::clone(&sync_on_resize);
+                let in_fs = c_layout.in_fullscreen.get();
+                let blk = RcBlock::new(move |_t: NonNull<NSTimer>| {
+                    s(in_fs);
+                });
+                let timer = unsafe {
+                    NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.20, false, &blk)
+                };
+                *c_layout.resize_debounce_timer.borrow_mut() = Some(timer);
             },
             move || {
                 on_end_resize(false);
