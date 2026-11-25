@@ -1,11 +1,13 @@
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
+    NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertStyle,
+    NSAlertThirdButtonReturn, NSApplication, NSApplicationTerminateReply,
     NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSScrollView, NSTextField, NSWindow,
     NSWindowStyleMask,
 };
 use objc2_foundation::NSString;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -16,8 +18,8 @@ use crate::disk;
 use crate::gui::display::VmDisplaySession;
 use crate::gui::downloader::DownloaderWindow;
 use crate::gui::widgets::{
-    self, FlippedView, TargetStore, pick_directory, pick_iso_file, rect, show_confirm_alert,
-    show_error_alert, size,
+    self, FlippedView, TargetStore, defer_error_alert, pick_directory, pick_iso_file, rect,
+    show_confirm_alert, show_error_alert, show_info_alert, size,
 };
 use crate::gui::wizard::{VmWizardWindow, WizardMode};
 use crate::vm::{VmState, is_virtualization_supported};
@@ -77,12 +79,20 @@ impl ManagerApp {
         );
         let brand = widgets::bold_label(mtm, rect(20.0, 10.0, 260.0, 22.0), "RustVM Manager", 18.0);
         let host = HostSpecs::detect();
+        let cpu_topology = if host.eff_cores > 0 {
+            format!(
+                "{} CPUs ({}P + {}E)",
+                host.cpu_count, host.perf_cores, host.eff_cores
+            )
+        } else {
+            format!("{} CPUs", host.cpu_count)
+        };
         let sub = widgets::secondary_label(
             mtm,
-            rect(20.0, 34.0, 440.0, 16.0),
+            rect(20.0, 34.0, 520.0, 16.0),
             &format!(
-                "Native Apple Silicon Linux Virtualization · Host: {} CPUs, {}",
-                host.cpu_count,
+                "Native Apple Silicon Linux Virtualization · Host: {}, {}",
+                cpu_topology,
                 format_memory_mb(host.total_memory_mb)
             ),
             11.5,
@@ -314,6 +324,114 @@ impl ManagerApp {
         self.render_detail();
     }
 
+    pub fn has_active_sessions(&self) -> bool {
+        self.sessions.borrow().values().any(|s| s.state().is_active())
+    }
+
+    pub fn confirm_app_termination(
+        &self,
+        _app: &NSApplication,
+    ) -> NSApplicationTerminateReply {
+        let active: Vec<Rc<VmDisplaySession>> = self
+            .sessions
+            .borrow()
+            .values()
+            .filter(|s| s.state().is_active())
+            .cloned()
+            .collect();
+
+        if active.is_empty() {
+            return NSApplicationTerminateReply::TerminateNow;
+        }
+
+        // Never interrupt an in-flight snapshot write/restore
+        if active
+            .iter()
+            .any(|s| matches!(s.state(), VmState::Saving | VmState::Restoring))
+        {
+            show_info_alert(
+                self.mtm,
+                "Snapshot in Progress",
+                "A virtual machine is currently saving or restoring its state. Please wait a moment for it to finish before quitting.",
+            );
+            return NSApplicationTerminateReply::TerminateCancel;
+        }
+
+        let all_can_save = active
+            .iter()
+            .all(|s| s.can_save_state() && matches!(s.state(), VmState::Running | VmState::Paused));
+
+        let alert = NSAlert::new(self.mtm);
+        alert.setAlertStyle(NSAlertStyle::Warning);
+        alert.setMessageText(&NSString::from_str(&format!(
+            "Quit RustVM with {} running VM{}?",
+            active.len(),
+            if active.len() == 1 { "" } else { "s" }
+        )));
+
+        if all_can_save {
+            alert.setInformativeText(&NSString::from_str(
+                "Save All & Quit freezes your running Linux session to disk so it resumes in ~1–2s next time with zero data loss.",
+            ));
+            alert.addButtonWithTitle(&NSString::from_str("Save All & Quit"));
+            alert.addButtonWithTitle(&NSString::from_str("Force Power Off & Quit"));
+            alert.addButtonWithTitle(&NSString::from_str("Graceful Shutdown"));
+            alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+            let resp = alert.runModal();
+            if resp == NSAlertFirstButtonReturn {
+                let remaining = Rc::new(Cell::new(active.len()));
+                let failed = Rc::new(Cell::new(false));
+                for sess in active {
+                    let rem = Rc::clone(&remaining);
+                    let fail = Rc::clone(&failed);
+                    let mtm = self.mtm;
+                    sess.save_state_and_close_with(move |res| {
+                        if let Err(msg) = res {
+                            fail.set(true);
+                            defer_error_alert(mtm, "Save State Failed", &msg);
+                        }
+                        let left = rem.get().saturating_sub(1);
+                        rem.set(left);
+                        if left == 0 {
+                            let app_shared = NSApplication::sharedApplication(mtm);
+                            app_shared.replyToApplicationShouldTerminate(!fail.get());
+                        }
+                    });
+                }
+                NSApplicationTerminateReply::TerminateLater
+            } else if resp == NSAlertSecondButtonReturn {
+                self.stop_all_sessions();
+                NSApplicationTerminateReply::TerminateNow
+            } else if resp == NSAlertThirdButtonReturn {
+                for sess in active {
+                    sess.request_stop();
+                }
+                NSApplicationTerminateReply::TerminateCancel
+            } else {
+                NSApplicationTerminateReply::TerminateCancel
+            }
+        } else {
+            alert.setInformativeText(&NSString::from_str(
+                "One or more virtual machines are still active. Force powering off without shutting down Linux first may lose unsaved guest work.",
+            ));
+            alert.addButtonWithTitle(&NSString::from_str("Force Power Off & Quit"));
+            alert.addButtonWithTitle(&NSString::from_str("Graceful Shutdown"));
+            alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+            let resp = alert.runModal();
+            if resp == NSAlertFirstButtonReturn {
+                self.stop_all_sessions();
+                NSApplicationTerminateReply::TerminateNow
+            } else if resp == NSAlertSecondButtonReturn {
+                for sess in active {
+                    sess.request_stop();
+                }
+                NSApplicationTerminateReply::TerminateCancel
+            } else {
+                NSApplicationTerminateReply::TerminateCancel
+            }
+        }
+    }
+
     pub fn stop_all_sessions(&self) {
         let active: Vec<Rc<VmDisplaySession>> = self.sessions.borrow().values().cloned().collect();
         for sess in active {
@@ -420,7 +538,15 @@ impl ManagerApp {
 
         for vm in vms {
             let is_sel = selected.as_deref() == Some(vm.id.as_str());
-            let state = self.vm_state(&vm.id);
+            let mut state = self.vm_state(&vm.id);
+            let ext_running = !state.is_active()
+                && store_opt
+                    .as_ref()
+                    .and_then(|s| s.running_pid(&vm.id))
+                    .is_some();
+            if ext_running {
+                state = VmState::Running;
+            }
             let has_saved = !state.is_active()
                 && store_opt
                     .as_ref()
@@ -504,7 +630,15 @@ impl ManagerApp {
             Ok(s) => s,
             Err(_) => return,
         };
-        let state = self.vm_state(&vm.id);
+        let mut state = self.vm_state(&vm.id);
+        let ext_pid = if !state.is_active() {
+            store.running_pid(&vm.id)
+        } else {
+            None
+        };
+        if ext_pid.is_some() {
+            state = VmState::Running;
+        }
         let is_active = state.is_active();
         let has_saved = !is_active && store.has_saved_state(&vm.id);
         let disk_path = store.disk_path(&vm.id);
@@ -772,9 +906,54 @@ impl ManagerApp {
                 format_bytes(usage.actual_bytes)
             ),
         );
+        {
+            let weak = Rc::downgrade(self);
+            let id = vm.id.clone();
+            let vm_name = vm.name.clone();
+            let dpath = disk_path.clone();
+            let compact_btn = widgets::push_button(
+                mtm,
+                rect(content_w - 134.0, 38.0, 118.0, 26.0),
+                "Compact Disk",
+                &mut targets,
+                move || {
+                    if let Some(app) = weak.upgrade() {
+                        if let Ok(st) = VmStore::open_default() {
+                            if let Err(e) = st.ensure_not_running(&id, &vm_name) {
+                                show_error_alert(mtm, "VM Is Running", &e.to_string());
+                                return;
+                            }
+                        }
+                        match disk::compact_sparse_disk(&dpath) {
+                            Ok(stats) => {
+                                app.reload_vms(Some(id.clone()));
+                                show_info_alert(
+                                    mtm,
+                                    &format!("Compacted '{}' Disk", vm_name),
+                                    &format!(
+                                        "Before: {}\nAfter: {}\nReclaimed: {} on your Mac SSD\n\nTip: Inside Linux, run 'sudo fstrim -av' (or zero deleted space) before compacting to reclaim freed filesystem blocks.",
+                                        format_bytes(stats.before_bytes),
+                                        format_bytes(stats.after_bytes),
+                                        format_bytes(stats.reclaimed_bytes)
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                show_error_alert(mtm, "Disk Compaction Failed", &e.to_string());
+                            }
+                        }
+                    }
+                },
+            );
+            compact_btn.setEnabled(!is_active && disk_path.is_file());
+            compact_btn.setToolTip(Some(&NSString::from_str(
+                "Punch sparse APFS holes over zeroed blocks in disk.img to reclaim unused SSD space",
+            )));
+            st_view.addSubview(&compact_btn);
+        }
         let disk_path_lbl = widgets::selectable_mono_label(
             mtm,
-            rect(112.0, 64.0, content_w - 130.0, 16.0),
+            rect(112.0, 66.0, content_w - 130.0, 16.0),
             &disk_path.display().to_string(),
             10.5,
         );
@@ -951,7 +1130,7 @@ impl ManagerApp {
             let btn_ref = copy_btn.clone();
             targets.bind_click(mtm, &copy_btn, move || {
                 widgets::copy_to_clipboard(
-                    "gsettings set org.gnome.desktop.interface enable-animations false && sudo apt update && sudo apt install -y spice-vdagent",
+                    "rm -f ~/.config/monitors.xml ~/.config/monitors.xml~ && gsettings set org.gnome.desktop.interface enable-animations false && sudo apt update && sudo apt install -y spice-vdagent qemu-guest-agent",
                 );
                 btn_ref.setTitle(&NSString::from_str("✓ Copied! Paste in Linux"));
             });

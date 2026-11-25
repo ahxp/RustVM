@@ -458,6 +458,37 @@ fn prepare_headless_iso_boot(
         ),
     ];
 
+    let boot_dir = store.vm_dir(vm_id).join("headless_boot");
+    fs::create_dir_all(&boot_dir)?;
+    let kernel_path = boot_dir.join("vmlinuz");
+    let initrd_path = boot_dir.join("initrd");
+    let stamp_path = boot_dir.join("iso_stamp.txt");
+    let cmdline_path = boot_dir.join("cmdline.txt");
+
+    // Fast path: reuse already-extracted uncompressed kernel & initrd if the ISO hasn't changed
+    let iso_meta = fs::metadata(iso_path)?;
+    let mtime_secs = iso_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stamp = format!("{}|{}|{}", iso_path.display(), iso_meta.len(), mtime_secs);
+    if kernel_path.is_file()
+        && initrd_path.is_file()
+        && fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str())
+    {
+        if let Ok(cached_cmd) = fs::read_to_string(&cmdline_path) {
+            if !cached_cmd.trim().is_empty() {
+                return Ok(Some(HeadlessIsoBoot {
+                    kernel_path,
+                    initrd_path,
+                    cmdline: cached_cmd.trim().to_string(),
+                }));
+            }
+        }
+    }
+
     let listing = Command::new("bsdtar")
         .arg("-tf")
         .arg(iso_path)
@@ -479,11 +510,6 @@ fn prepare_headless_iso_boot(
     let Some(&(kernel_entry, initrd_entry, cmdline)) = matched else {
         return Ok(None);
     };
-
-    let boot_dir = store.vm_dir(vm_id).join("headless_boot");
-    fs::create_dir_all(&boot_dir)?;
-    let kernel_path = boot_dir.join("vmlinuz");
-    let initrd_path = boot_dir.join("initrd");
 
     let k_out = Command::new("bsdtar")
         .args(["-xOf"])
@@ -508,6 +534,8 @@ fn prepare_headless_iso_boot(
         return Ok(None);
     }
     fs::write(&initrd_path, i_out.stdout)?;
+    let _ = fs::write(&cmdline_path, cmdline);
+    let _ = fs::write(&stamp_path, stamp);
 
     Ok(Some(HeadlessIsoBoot {
         kernel_path,

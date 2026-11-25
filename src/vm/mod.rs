@@ -1,5 +1,6 @@
 pub mod config_builder;
 pub mod console;
+pub mod lock;
 pub mod power;
 pub mod runner;
 

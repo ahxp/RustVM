@@ -3,7 +3,7 @@ use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2_foundation::NSFileHandle;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
@@ -89,8 +89,10 @@ impl SerialBridge {
             .with_context(|| format!("Failed to open serial log {}", log_path.display()))?;
         let stop_out = Arc::clone(&stop_flag);
         threads.push(thread::spawn(move || {
+            const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
             let mut reader = unsafe { File::from_raw_fd(out_read_fd) };
             let mut log = log_file;
+            let mut log_written: u64 = 0;
             let mut stdout = std::io::stdout();
             let mut buf = [0u8; 4096];
             while !stop_out.load(Ordering::Relaxed) {
@@ -99,8 +101,15 @@ impl SerialBridge {
                     Ok(n) => {
                         let _ = stdout.write_all(&buf[..n]);
                         let _ = stdout.flush();
+                        if log_written + (n as u64) > MAX_LOG_BYTES {
+                            let _ = log.set_len(0);
+                            let _ = log.seek(SeekFrom::Start(0));
+                            let _ = log.write_all(b"[RustVM: serial.log wrapped at 8 MiB]\n");
+                            log_written = 0;
+                        }
                         let _ = log.write_all(&buf[..n]);
                         let _ = log.flush();
+                        log_written += n as u64;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,

@@ -17,7 +17,11 @@ A simple, fast, VirtualBox-style Linux virtual machine manager written in **100%
 - **Live USB ISO Attach & Eject**: Attach an installer ISO to install Linux onto a sparse APFS virtual disk, then click **Eject ISO** (even while the VM is running!) and reboot straight into your installed OS.
 - **Full Virtual Hardware & Performance Tuning**:
   - UEFI boot (`VZEFIBootLoader`) with persistent NVRAM (`nvram.bin`)
-  - **Instant Suspend / Resume (`Save & Close`)**: freezes VM state to disk (`state.vzsave`) so closed VMs use **0 MB RAM / 0% CPU** and resume in ~1–2 seconds
+  - **Instant Suspend / Resume (`Save & Close` & Safe `Cmd+Q`)**: freezes VM state to disk (`state.vzsave`) so closed VMs use **0 MB RAM / 0% CPU** and resume in ~1–2 seconds, with safe `Cmd+Q` confirmation (**Save All & Quit**)
+  - **One-Click APFS Sparse Disk Compaction (`Compact Disk` / `rustvm compact`)**: punches sparse APFS holes (`F_PUNCHHOLE`) over zeroed disk blocks in-place using `F_NOCACHE` to reclaim gigabytes of host SSD space
+  - **Crash-Safe Exclusive VM Locking (`vm.lock`) & Auto-Healing NAT**: POSIX `flock` prevents concurrent boot/edit/delete disk corruption across GUI and CLI, and automatically reattaches macOS NAT if host networking resets
+  - **Apple Silicon P-Core / E-Core Detection**: detects Performance vs. Efficiency core counts and highlights optimal desktop vCPU allocations so macOS `WindowServer`/Metal compositing stays silky-smooth
+  - **Resumable ISO Downloads**: 30s stall protection + automatic HTTP `Range` (`206 Partial Content`) resume on interrupted `.iso.part` downloads
   - **True Edge-to-Edge Fullscreen & 3 Display Scale Modes**: hides window chrome in fullscreen and scales cleanly at **`1× Smooth`**, **`1.5× Crisp`** (default — 2.25× sharper fullscreen with smooth performance), or **`2× Retina`** (native pixel-for-pixel clarity) with exact 2px aspect-ratio alignment
   - **3 Disk I/O Modes**: **Fastest** (`Cached + Fsync`, default — 2×–5× faster random I/O), **Low-RAM** (`Uncached + Fsync`), and **Strict** (`Full Sync`), plus `Uncached` ISO reads
   - **Keep Mac & Screen Awake**: native macOS IOKit power assertions (`PreventUserIdleDisplaySleep` + `PreventUserIdleSystemSleep`) automatically prevent screen turn-off and sleep while any VM is running (live **Keep Awake** toggle on the toolbar; releases immediately when paused/stopped/saved)
@@ -47,7 +51,7 @@ To also install `RustVM.app` into `~/Applications`:
 ./setup.sh --install-app
 ```
 
-To package a distributable macOS `.dmg` installer (`dist/RustVM-1.1.3-arm64.dmg`):
+To package a distributable macOS `.dmg` installer (`dist/RustVM-1.2.1-arm64.dmg`):
 
 ```bash
 ./build-dmg.sh
@@ -98,6 +102,7 @@ rustvm start "My Ubuntu" --headless                     # Start in Terminal seri
 rustvm iso "My Ubuntu" eject                            # Eject ISO after OS install
 rustvm iso "My Ubuntu" attach /path/to/installer.iso    # Attach an ISO
 rustvm config "My Ubuntu" --cpus 6 --ram 8 --share ~/Shared
+rustvm compact "My Ubuntu"                              # Reclaim zeroed space on Mac SSD (APFS hole-punch)
 rustvm delete "My Ubuntu"                               # Delete VM and its disk image
 ```
 

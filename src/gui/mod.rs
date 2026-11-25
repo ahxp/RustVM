@@ -9,7 +9,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSMenu, NSMenuItem,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
+    NSApplicationTerminateReply, NSMenu, NSMenuItem,
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString};
 use std::cell::RefCell;
@@ -48,7 +49,20 @@ define_class!(
 
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
         fn should_terminate_after_last_window_closed(&self, _sender: &NSApplication) -> bool {
-            true
+            if let Some(ref mgr) = *self.ivars().manager.borrow() {
+                !mgr.has_active_sessions()
+            } else {
+                true
+            }
+        }
+
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn should_terminate(&self, sender: &NSApplication) -> NSApplicationTerminateReply {
+            if let Some(ref mgr) = *self.ivars().manager.borrow() {
+                mgr.confirm_app_termination(sender)
+            } else {
+                NSApplicationTerminateReply::TerminateNow
+            }
         }
 
         #[unsafe(method(applicationWillTerminate:))]

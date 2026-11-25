@@ -241,12 +241,27 @@ impl VmWizardWindow {
         let max_ram_half_gb = (host.max_vm_memory_mb() / 512).max(2) as f64;
         let min_disk_gb = if is_edit { init_disk_gb as f64 } else { 4.0 };
 
+        let opt_cpus = host.optimal_desktop_cpus();
+        let cpu_label_for = move |n: usize| -> String {
+            if host.eff_cores > 0 && n > host.perf_cores {
+                format!("{n} vCPUs (+E)")
+            } else if n == opt_cpus {
+                format!("{n} vCPUs ★")
+            } else {
+                format!("{n} vCPUs")
+            }
+        };
+
         let cpu_readout = widgets::semibold_label(
             mtm,
             rect(ctrl_x + ctrl_w - 108.0, y + 78.0, 108.0, 18.0),
-            &format!("{} vCPUs", init_cpus),
+            &cpu_label_for(init_cpus),
             12.5,
         );
+        cpu_readout.setToolTip(Some(&NSString::from_str(&format!(
+            "Host has {} Performance + {} Efficiency cores. Up to {} vCPUs (★) keeps 2 P-cores free for smooth macOS Metal compositing.",
+            host.perf_cores, host.eff_cores, opt_cpus
+        ))));
         let ram_readout = widgets::semibold_label(
             mtm,
             rect(ctrl_x + ctrl_w - 108.0, y + 114.0, 108.0, 18.0),
@@ -277,7 +292,7 @@ impl VmWizardWindow {
                 move |v| {
                     let n = v.round().max(1.0) as usize;
                     cv.set(n);
-                    cr.setStringValue(&NSString::from_str(&format!("{n} vCPUs")));
+                    cr.setStringValue(&NSString::from_str(&cpu_label_for(n)));
                 },
             );
         }
@@ -351,7 +366,7 @@ impl VmWizardWindow {
                             cs.setDoubleValue(c as f64);
                             rs.setDoubleValue((r_mb as f64 / 512.0).round().max(1.0));
                             ds.setDoubleValue(d as f64);
-                            cr.setStringValue(&NSString::from_str(&format!("{c} vCPUs")));
+                            cr.setStringValue(&NSString::from_str(&cpu_label_for(c)));
                             rr.setStringValue(&NSString::from_str(&format_memory_mb(r_mb)));
                             dr.setStringValue(&NSString::from_str(&format!("{d} GB")));
 

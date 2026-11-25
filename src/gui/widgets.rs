@@ -1,3 +1,4 @@
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
@@ -9,9 +10,10 @@ use objc2_app_kit::{
     NSProgressIndicatorStyle, NSSlider, NSTextField, NSTitlePosition, NSView,
 };
 use objc2_core_foundation::{CGFloat, CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSObject, NSObjectProtocol, NSRect, NSSize, NSString};
+use objc2_foundation::{NSObject, NSObjectProtocol, NSRect, NSSize, NSString, NSTimer};
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::ptr::NonNull;
 
 /// A simple `NSView` subclass using top-left coordinates (`isFlipped = true`).
 pub struct FlippedViewIvars;
@@ -360,6 +362,28 @@ pub fn show_error_alert(mtm: MainThreadMarker, title: &str, message: &str) {
     alert.setInformativeText(&NSString::from_str(message));
     alert.addButtonWithTitle(&NSString::from_str("OK"));
     alert.runModal();
+}
+
+pub fn show_info_alert(mtm: MainThreadMarker, title: &str, message: &str) {
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Informational);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(message));
+    alert.addButtonWithTitle(&NSString::from_str("OK"));
+    alert.runModal();
+}
+
+/// Schedules a modal error alert on the next main runloop tick so Objective-C
+/// `Virtualization.framework` completion/delegate frames unwind cleanly first.
+pub fn defer_error_alert(mtm: MainThreadMarker, title: &str, message: &str) {
+    let t = title.to_string();
+    let m = message.to_string();
+    let blk = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        show_error_alert(mtm, &t, &m);
+    });
+    unsafe {
+        let _ = NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.0, false, &blk);
+    }
 }
 
 pub fn show_confirm_alert(

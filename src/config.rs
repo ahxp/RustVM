@@ -221,6 +221,8 @@ fn format_unix_timestamp(secs: u64) -> String {
 #[derive(Debug, Clone, Copy)]
 pub struct HostSpecs {
     pub cpu_count: usize,
+    pub perf_cores: usize,
+    pub eff_cores: usize,
     pub total_memory_mb: u64,
 }
 
@@ -229,9 +231,18 @@ impl HostSpecs {
         let cpu_count = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
+        let perf_cores = sysctl_u32(c"hw.perflevel0.physicalcpu")
+            .map(|n| n as usize)
+            .filter(|&n| n > 0 && n <= cpu_count)
+            .unwrap_or(cpu_count);
+        let eff_cores = sysctl_u32(c"hw.perflevel1.physicalcpu")
+            .map(|n| n as usize)
+            .unwrap_or_else(|| cpu_count.saturating_sub(perf_cores));
         let total_memory_mb = host_memory_bytes() / (1024 * 1024);
         Self {
             cpu_count,
+            perf_cores,
+            eff_cores,
             total_memory_mb: total_memory_mb.max(4096),
         }
     }
@@ -240,8 +251,21 @@ impl HostSpecs {
         self.cpu_count.max(1)
     }
 
+    /// Optimal ceiling for smooth desktop VMs: keeps at least 2 P-cores free for macOS
+    /// WindowServer/Metal compositing and avoids spilling guest vCPUs onto slower E-cores.
+    pub fn optimal_desktop_cpus(&self) -> usize {
+        if self.perf_cores >= 4 {
+            self.perf_cores.saturating_sub(2).max(2)
+        } else {
+            self.perf_cores.max(1)
+        }
+    }
+
     pub fn recommended_cpus(&self) -> usize {
-        (self.cpu_count / 2).clamp(2, 4).min(self.cpu_count)
+        (self.perf_cores / 2)
+            .clamp(2, 6)
+            .min(self.optimal_desktop_cpus())
+            .min(self.cpu_count)
     }
 
     pub fn max_vm_memory_mb(&self) -> u64 {
@@ -252,6 +276,21 @@ impl HostSpecs {
     pub fn recommended_memory_mb(&self) -> u64 {
         4096.min(self.max_vm_memory_mb())
     }
+}
+
+fn sysctl_u32(name: &std::ffi::CStr) -> Option<u32> {
+    let mut val: u32 = 0;
+    let mut size = std::mem::size_of::<u32>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut val as *mut u32 as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 { Some(val) } else { None }
 }
 
 fn host_memory_bytes() -> u64 {
@@ -346,6 +385,28 @@ impl VmStore {
 
     pub fn saved_state_path(&self, id: &str) -> PathBuf {
         self.vm_dir(id).join("state.vzsave")
+    }
+
+    pub fn lock_path(&self, id: &str) -> PathBuf {
+        self.vm_dir(id).join("vm.lock")
+    }
+
+    pub fn running_pid(&self, id: &str) -> Option<u32> {
+        crate::vm::lock::is_vm_locked(&self.lock_path(id))
+    }
+
+    pub fn ensure_not_running(&self, id: &str, name: &str) -> Result<()> {
+        if let Some(pid) = self.running_pid(id) {
+            let pid_txt = if pid > 0 {
+                format!(" (PID {pid})")
+            } else {
+                String::new()
+            };
+            bail!(
+                "Virtual machine '{name}' is currently running{pid_txt}. Shut it down first."
+            );
+        }
+        Ok(())
     }
 
     pub fn has_saved_state(&self, id: &str) -> bool {
@@ -486,6 +547,7 @@ impl VmStore {
         if !dir.exists() {
             bail!("VM directory does not exist: {}", dir.display());
         }
+        self.ensure_not_running(id, id)?;
         fs::remove_dir_all(&dir)
             .with_context(|| format!("Failed to delete VM directory {}", dir.display()))?;
         Ok(())

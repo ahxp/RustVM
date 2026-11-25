@@ -6,25 +6,32 @@ use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_core_foundation::CGSize;
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol, NSTimer};
 use objc2_virtualization::{
+    VZNATNetworkDeviceAttachment, VZNetworkDevice, VZNetworkDeviceAttachment,
     VZUSBMassStorageDevice, VZVirtioTraditionalMemoryBalloonDevice, VZVirtualMachine,
     VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
 };
 use std::cell::{Cell, RefCell};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::time::Instant;
 
-use crate::config::{VmConfig, VmStore};
+use crate::config::{VmConfig, VmStore, format_bytes};
+use crate::disk;
 use crate::vm::config_builder::{build_usb_iso_config, build_vz_configuration, file_url};
 use crate::vm::console::SerialBridge;
+use crate::vm::lock::VmLock;
 use crate::vm::power::SleepInhibitor;
 use crate::vm::{VmEvent, VmState, is_virtualization_supported};
-use std::fs;
 
-type EventCallback = Rc<RefCell<Box<dyn FnMut(VmEvent)>>>;
+/// Immutable `Fn` callback so nested Objective-C delegate / modal NSAlert callbacks
+/// can never trigger a `RefCell` `BorrowMutError` panic across FFI boundaries.
+type EventCallback = Rc<dyn Fn(VmEvent)>;
 
 pub struct VmDelegateIvars {
     on_event: EventCallback,
+    net_recovery_window: Cell<(Instant, u32)>,
 }
 
 define_class!(
@@ -37,25 +44,65 @@ define_class!(
     unsafe impl VZVirtualMachineDelegate for RustVmDelegate {
         #[unsafe(method(guestDidStopVirtualMachine:))]
         fn guest_did_stop(&self, _vm: &VZVirtualMachine) {
-            (self.ivars().on_event.borrow_mut())(VmEvent::GuestStopped);
+            (self.ivars().on_event)(VmEvent::GuestStopped);
         }
 
         #[unsafe(method(virtualMachine:didStopWithError:))]
         fn did_stop_with_error(&self, _vm: &VZVirtualMachine, error: &NSError) {
             let msg = error.localizedDescription().to_string();
-            (self.ivars().on_event.borrow_mut())(VmEvent::StoppedWithError(msg));
+            (self.ivars().on_event)(VmEvent::StoppedWithError(msg));
+        }
+
+        #[unsafe(method(virtualMachine:networkDevice:attachmentWasDisconnectedWithError:))]
+        fn network_was_disconnected(
+            &self,
+            _vm: &VZVirtualMachine,
+            network_device: &VZNetworkDevice,
+            error: &NSError,
+        ) {
+            let now = Instant::now();
+            let (win_start, count) = self.ivars().net_recovery_window.get();
+            let next_count = if now.duration_since(win_start).as_secs() > 15 {
+                self.ivars().net_recovery_window.set((now, 1));
+                1
+            } else {
+                let c = count + 1;
+                self.ivars().net_recovery_window.set((win_start, c));
+                c
+            };
+
+            if next_count <= 5 {
+                unsafe {
+                    let nat = VZNATNetworkDeviceAttachment::new();
+                    let nat_super: Retained<VZNetworkDeviceAttachment> = Retained::into_super(nat);
+                    network_device.setAttachment(Some(&nat_super));
+                }
+                eprintln!(
+                    "[RustVM] Guest network disconnected ({}); automatically reattached macOS NAT.",
+                    error.localizedDescription()
+                );
+            } else {
+                (self.ivars().on_event)(VmEvent::ActionError(format!(
+                    "Guest network disconnected repeatedly: {}",
+                    error.localizedDescription()
+                )));
+            }
         }
     }
 );
 
 impl RustVmDelegate {
     fn new(on_event: EventCallback) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(VmDelegateIvars { on_event });
+        let this = Self::alloc().set_ivars(VmDelegateIvars {
+            on_event,
+            net_recovery_window: Cell::new((Instant::now(), 0)),
+        });
         unsafe { msg_send![super(this), init] }
     }
 }
 
 pub struct VmRunner {
+    _vm_lock: VmLock,
     vm: Retained<VZVirtualMachine>,
     _delegate: Retained<RustVmDelegate>,
     serial: SerialBridge,
@@ -69,7 +116,7 @@ pub struct VmRunner {
 }
 
 impl VmRunner {
-    /// Creates a new `VmRunner` on the main dispatch queue.
+    /// Creates a new `VmRunner` on the main dispatch queue after acquiring an exclusive `vm.lock`.
     pub fn new<F>(
         store: &VmStore,
         cfg: &VmConfig,
@@ -78,11 +125,14 @@ impl VmRunner {
         on_event: F,
     ) -> Result<Self>
     where
-        F: FnMut(VmEvent) + 'static,
+        F: Fn(VmEvent) + 'static,
     {
         if !is_virtualization_supported() {
             bail!("Apple Virtualization.framework is not supported on this Mac.");
         }
+
+        // Acquire exclusive kernel lock before touching NVRAM or virtual disk image
+        let vm_lock = VmLock::acquire(&store.lock_path(&cfg.id), &cfg.name)?;
 
         let vz_config = build_vz_configuration(store, cfg, &serial, headless)?;
         let sleep_inhibitor = Rc::new(RefCell::new(SleepInhibitor::new()));
@@ -92,8 +142,7 @@ impl VmRunner {
         let inh_ev = Rc::clone(&sleep_inhibitor);
         let prev_ev = Rc::clone(&prevent_sleep);
         let reason_ev = sleep_reason.clone();
-        let mut user_cb = on_event;
-        let wrapped_cb: EventCallback = Rc::new(RefCell::new(Box::new(move |event: VmEvent| {
+        let wrapped_cb: EventCallback = Rc::new(move |event: VmEvent| {
             match &event {
                 VmEvent::StateChanged(VmState::Running) => {
                     if prev_ev.get() {
@@ -113,8 +162,8 @@ impl VmRunner {
                 }
                 _ => {}
             }
-            (user_cb)(event);
-        })));
+            on_event(event);
+        });
 
         let delegate = RustVmDelegate::new(Rc::clone(&wrapped_cb));
 
@@ -135,6 +184,7 @@ impl VmRunner {
         };
 
         Ok(Self {
+            _vm_lock: vm_lock,
             vm,
             _delegate: delegate,
             serial,
@@ -188,23 +238,23 @@ impl VmRunner {
                 let cb = Rc::clone(&self.on_event);
                 let vm_clone = self.vm.clone();
                 let state_path = saved_state_path.to_path_buf();
-                (cb.borrow_mut())(VmEvent::StateChanged(VmState::Restoring));
+                (cb)(VmEvent::StateChanged(VmState::Restoring));
 
                 let block = RcBlock::new(move |err: *mut NSError| {
                     let _ = fs::remove_file(&state_path);
                     if unsafe { err.as_ref() }.is_some() {
                         // Snapshot incompatible (e.g., macOS update or config edit) — fall back to clean boot
                         let cb2 = Rc::clone(&cb);
-                        (cb2.borrow_mut())(VmEvent::StateChanged(VmState::Starting));
+                        (cb2)(VmEvent::StateChanged(VmState::Starting));
                         let start_blk = RcBlock::new(move |start_err: *mut NSError| {
                             if let Some(e) = unsafe { start_err.as_ref() } {
-                                (cb2.borrow_mut())(VmEvent::ActionError(format!(
+                                (cb2)(VmEvent::ActionError(format!(
                                     "Failed to start VM: {}",
                                     e.localizedDescription()
                                 )));
-                                (cb2.borrow_mut())(VmEvent::StateChanged(VmState::Stopped));
+                                (cb2)(VmEvent::StateChanged(VmState::Stopped));
                             } else {
-                                (cb2.borrow_mut())(VmEvent::StateChanged(VmState::Running));
+                                (cb2)(VmEvent::StateChanged(VmState::Running));
                             }
                         });
                         unsafe {
@@ -213,16 +263,16 @@ impl VmRunner {
                     } else {
                         // Restore succeeded (VM is now Paused) -> immediately resume!
                         let cb2 = Rc::clone(&cb);
-                        (cb2.borrow_mut())(VmEvent::StateChanged(VmState::Resuming));
+                        (cb2)(VmEvent::StateChanged(VmState::Resuming));
                         let resume_blk = RcBlock::new(move |res_err: *mut NSError| {
                             if let Some(e) = unsafe { res_err.as_ref() } {
-                                (cb2.borrow_mut())(VmEvent::ActionError(format!(
+                                (cb2)(VmEvent::ActionError(format!(
                                     "Failed to resume restored VM: {}",
                                     e.localizedDescription()
                                 )));
-                                (cb2.borrow_mut())(VmEvent::StateChanged(VmState::Paused));
+                                (cb2)(VmEvent::StateChanged(VmState::Paused));
                             } else {
-                                (cb2.borrow_mut())(VmEvent::StateChanged(VmState::Running));
+                                (cb2)(VmEvent::StateChanged(VmState::Running));
                             }
                         });
                         unsafe {
@@ -251,6 +301,20 @@ impl VmRunner {
             )));
             return;
         }
+
+        // Preflight free disk space check so we never fill the host volume mid-snapshot
+        let min_required = (self.configured_memory_bytes / 2).max(512 * 1024 * 1024);
+        if let Some(avail) = disk::available_space_bytes(saved_state_path) {
+            if avail < min_required {
+                on_done(Err(format!(
+                    "Not enough free disk space on your Mac to save VM state ({} free, need at least {}).",
+                    format_bytes(avail),
+                    format_bytes(min_required)
+                )));
+                return;
+            }
+        }
+
         let tmp_path = saved_state_path.with_extension("vzsave.tmp");
         let _ = fs::remove_file(&tmp_path);
         let Ok(tmp_url) = file_url(&tmp_path) else {
@@ -262,31 +326,32 @@ impl VmRunner {
         let cb = Rc::clone(&self.on_event);
         let vm = self.vm.clone();
         let on_done = Rc::new(on_done);
-        (cb.borrow_mut())(VmEvent::StateChanged(VmState::Saving));
+        let on_done_run = Rc::clone(&on_done);
+        (cb)(VmEvent::StateChanged(VmState::Saving));
 
         let run_save = Rc::new(move || {
             let cb_save = Rc::clone(&cb);
             let vm_save = vm.clone();
-            let done_save = Rc::clone(&on_done);
+            let done_save = Rc::clone(&on_done_run);
             let tmp_p = tmp_path.clone();
             let fin_p = final_path.clone();
             let save_block = RcBlock::new(move |err: *mut NSError| {
                 if let Some(e) = unsafe { err.as_ref() } {
                     let _ = fs::remove_file(&tmp_p);
                     let msg = format!("Failed to save VM state: {}", e.localizedDescription());
-                    (cb_save.borrow_mut())(VmEvent::StateChanged(VmState::Paused));
+                    (cb_save)(VmEvent::StateChanged(VmState::Paused));
                     (done_save)(Err(msg));
                 } else {
                     if let Err(io_err) = fs::rename(&tmp_p, &fin_p) {
                         let _ = fs::remove_file(&tmp_p);
-                        (cb_save.borrow_mut())(VmEvent::StateChanged(VmState::Paused));
+                        (cb_save)(VmEvent::StateChanged(VmState::Paused));
                         (done_save)(Err(format!("Failed to finalize saved state: {io_err}")));
                         return;
                     }
                     let cb_stop = Rc::clone(&cb_save);
                     let done_stop = Rc::clone(&done_save);
                     let stop_block = RcBlock::new(move |_stop_err: *mut NSError| {
-                        (cb_stop.borrow_mut())(VmEvent::GuestStopped);
+                        (cb_stop)(VmEvent::GuestStopped);
                         (done_stop)(Ok(()));
                     });
                     unsafe {
@@ -302,11 +367,15 @@ impl VmRunner {
         if self.can_pause() {
             let save_after_pause = Rc::clone(&run_save);
             let cb_pause = Rc::clone(&self.on_event);
+            let done_pause = Rc::clone(&on_done);
             let pause_block = RcBlock::new(move |err: *mut NSError| {
                 if let Some(e) = unsafe { err.as_ref() } {
-                    let msg = format!("Failed to pause VM before saving: {}", e.localizedDescription());
-                    (cb_pause.borrow_mut())(VmEvent::ActionError(msg));
-                    (cb_pause.borrow_mut())(VmEvent::StateChanged(VmState::Running));
+                    let msg = format!(
+                        "Failed to pause VM before saving: {}",
+                        e.localizedDescription()
+                    );
+                    (cb_pause)(VmEvent::StateChanged(VmState::Running));
+                    (done_pause)(Err(msg));
                 } else {
                     (save_after_pause)();
                 }
@@ -316,26 +385,31 @@ impl VmRunner {
             }
         } else if self.state() == VmState::Paused {
             (run_save)();
+        } else {
+            on_done(Err("VM must be running or paused to save state.".into()));
         }
     }
 
     pub fn start(&self) {
         let cb = Rc::clone(&self.on_event);
-        (cb.borrow_mut())(VmEvent::StateChanged(VmState::Starting));
+        (cb)(VmEvent::StateChanged(VmState::Starting));
         let block = RcBlock::new(move |err: *mut NSError| {
             if let Some(err_ref) = unsafe { err.as_ref() } {
                 let msg = err_ref.localizedDescription().to_string();
-                let hint = if msg.contains("entitlement") || msg.contains("permission") || msg.contains("privileg") {
+                let hint = if msg.contains("entitlement")
+                    || msg.contains("permission")
+                    || msg.contains("privileg")
+                {
                     format!(
                         "{msg}\n\nTip: Sign the binary with `./setup.sh` or `codesign --entitlements entitlements.plist --force -s - <binary>`."
                     )
                 } else {
                     msg
                 };
-                (cb.borrow_mut())(VmEvent::ActionError(format!("Failed to start VM: {hint}")));
-                (cb.borrow_mut())(VmEvent::StateChanged(VmState::Stopped));
+                (cb)(VmEvent::ActionError(format!("Failed to start VM: {hint}")));
+                (cb)(VmEvent::StateChanged(VmState::Stopped));
             } else {
-                (cb.borrow_mut())(VmEvent::StateChanged(VmState::Running));
+                (cb)(VmEvent::StateChanged(VmState::Running));
             }
         });
         unsafe {
@@ -348,16 +422,16 @@ impl VmRunner {
             return;
         }
         let cb = Rc::clone(&self.on_event);
-        (cb.borrow_mut())(VmEvent::StateChanged(VmState::Pausing));
+        (cb)(VmEvent::StateChanged(VmState::Pausing));
         let block = RcBlock::new(move |err: *mut NSError| {
             if let Some(err_ref) = unsafe { err.as_ref() } {
-                (cb.borrow_mut())(VmEvent::ActionError(format!(
+                (cb)(VmEvent::ActionError(format!(
                     "Failed to pause VM: {}",
                     err_ref.localizedDescription()
                 )));
-                (cb.borrow_mut())(VmEvent::StateChanged(VmState::Running));
+                (cb)(VmEvent::StateChanged(VmState::Running));
             } else {
-                (cb.borrow_mut())(VmEvent::StateChanged(VmState::Paused));
+                (cb)(VmEvent::StateChanged(VmState::Paused));
             }
         });
         unsafe {
@@ -370,16 +444,16 @@ impl VmRunner {
             return;
         }
         let cb = Rc::clone(&self.on_event);
-        (cb.borrow_mut())(VmEvent::StateChanged(VmState::Resuming));
+        (cb)(VmEvent::StateChanged(VmState::Resuming));
         let block = RcBlock::new(move |err: *mut NSError| {
             if let Some(err_ref) = unsafe { err.as_ref() } {
-                (cb.borrow_mut())(VmEvent::ActionError(format!(
+                (cb)(VmEvent::ActionError(format!(
                     "Failed to resume VM: {}",
                     err_ref.localizedDescription()
                 )));
-                (cb.borrow_mut())(VmEvent::StateChanged(VmState::Paused));
+                (cb)(VmEvent::StateChanged(VmState::Paused));
             } else {
-                (cb.borrow_mut())(VmEvent::StateChanged(VmState::Running));
+                (cb)(VmEvent::StateChanged(VmState::Running));
             }
         });
         unsafe {
@@ -394,7 +468,7 @@ impl VmRunner {
         }
         let res = unsafe { self.vm.requestStopWithError() };
         if let Err(e) = res {
-            (self.on_event.borrow_mut())(VmEvent::ActionError(format!(
+            (self.on_event)(VmEvent::ActionError(format!(
                 "Graceful shutdown failed: {}",
                 e.localizedDescription()
             )));
@@ -404,19 +478,19 @@ impl VmRunner {
     /// Immediately powers off the VM (equivalent to pulling the power cord).
     pub fn force_stop(&self) {
         if !self.can_stop() {
-            (self.on_event.borrow_mut())(VmEvent::GuestStopped);
+            (self.on_event)(VmEvent::GuestStopped);
             return;
         }
         let cb = Rc::clone(&self.on_event);
-        (cb.borrow_mut())(VmEvent::StateChanged(VmState::Stopping));
+        (cb)(VmEvent::StateChanged(VmState::Stopping));
         let block = RcBlock::new(move |err: *mut NSError| {
             if let Some(err_ref) = unsafe { err.as_ref() } {
-                (cb.borrow_mut())(VmEvent::ActionError(format!(
+                (cb)(VmEvent::ActionError(format!(
                     "Force stop error: {}",
                     err_ref.localizedDescription()
                 )));
             }
-            (cb.borrow_mut())(VmEvent::GuestStopped);
+            (cb)(VmEvent::GuestStopped);
         });
         unsafe {
             self.vm.stopWithCompletionHandler(&block);
@@ -428,13 +502,13 @@ impl VmRunner {
         unsafe {
             let controllers = self.vm.usbControllers();
             if controllers.is_empty() {
-                (self.on_event.borrow_mut())(VmEvent::IsoChanged(None));
+                (self.on_event)(VmEvent::IsoChanged(None));
                 return;
             }
             let ctrl = controllers.objectAtIndex(0);
             let devices = ctrl.usbDevices();
             if devices.is_empty() {
-                (self.on_event.borrow_mut())(VmEvent::IsoChanged(None));
+                (self.on_event)(VmEvent::IsoChanged(None));
                 return;
             }
             let total = devices.count();
@@ -444,12 +518,12 @@ impl VmRunner {
                 let is_last = i + 1 == total;
                 let block = RcBlock::new(move |err: *mut NSError| {
                     if let Some(err_ref) = err.as_ref() {
-                        (cb.borrow_mut())(VmEvent::ActionError(format!(
+                        (cb)(VmEvent::ActionError(format!(
                             "Failed to eject ISO: {}",
                             err_ref.localizedDescription()
                         )));
                     } else if is_last {
-                        (cb.borrow_mut())(VmEvent::IsoChanged(None));
+                        (cb)(VmEvent::IsoChanged(None));
                     }
                 });
                 ctrl.detachDevice_completionHandler(&dev, &block);
@@ -457,8 +531,8 @@ impl VmRunner {
         }
     }
 
-    /// Hot-attaches an ISO image as a USB Mass Storage device to the running VM
-    /// (detaching any existing USB ISO first).
+    /// Hot-attaches an ISO image as a USB Mass Storage device to the running VM,
+    /// cleanly waiting for any existing USB ISO detach completion before attaching.
     pub fn hot_attach_iso(&self, iso_path: &Path) -> Result<()> {
         let usb_cfg = build_usb_iso_config(iso_path)?;
         let iso_owned: PathBuf = iso_path.to_path_buf();
@@ -468,39 +542,63 @@ impl VmRunner {
                 bail!("VM has no USB controller");
             }
             let ctrl = controllers.objectAtIndex(0);
-            // Detach existing USB storage devices if any
-            let existing = ctrl.usbDevices();
-            for i in 0..existing.count() {
-                let dev = existing.objectAtIndex(i);
-                let noop = RcBlock::new(|_err: *mut NSError| {});
-                ctrl.detachDevice_completionHandler(&dev, &noop);
-            }
             let usb_dev = VZUSBMassStorageDevice::initWithConfiguration(
                 VZUSBMassStorageDevice::alloc(),
                 &usb_cfg,
             );
             let usb_proto = ProtocolObject::from_retained(usb_dev);
             let cb = Rc::clone(&self.on_event);
-            let block = RcBlock::new(move |err: *mut NSError| {
-                if let Some(err_ref) = err.as_ref() {
-                    (cb.borrow_mut())(VmEvent::ActionError(format!(
-                        "Failed to attach ISO: {}",
-                        err_ref.localizedDescription()
-                    )));
-                } else {
-                    (cb.borrow_mut())(VmEvent::IsoChanged(Some(iso_owned.clone())));
+
+            let do_attach = {
+                let ctrl_att = ctrl.clone();
+                Rc::new(move || {
+                    let cb_att = Rc::clone(&cb);
+                    let iso_done = iso_owned.clone();
+                    let attach_blk = RcBlock::new(move |err: *mut NSError| {
+                        if let Some(err_ref) = err.as_ref() {
+                            (cb_att)(VmEvent::ActionError(format!(
+                                "Failed to attach ISO: {}",
+                                err_ref.localizedDescription()
+                            )));
+                        } else {
+                            (cb_att)(VmEvent::IsoChanged(Some(iso_done.clone())));
+                        }
+                    });
+                    ctrl_att.attachDevice_completionHandler(&usb_proto, &attach_blk);
+                })
+            };
+
+            let existing = ctrl.usbDevices();
+            let total = existing.count();
+            if total == 0 {
+                (do_attach)();
+            } else {
+                let remaining = Rc::new(Cell::new(total));
+                for i in 0..total {
+                    let dev = existing.objectAtIndex(i);
+                    let rem = Rc::clone(&remaining);
+                    let attach_after = Rc::clone(&do_attach);
+                    let detach_blk = RcBlock::new(move |_err: *mut NSError| {
+                        let left = rem.get().saturating_sub(1);
+                        rem.set(left);
+                        if left == 0 {
+                            (attach_after)();
+                        }
+                    });
+                    ctrl.detachDevice_completionHandler(&dev, &detach_blk);
                 }
-            });
-            ctrl.attachDevice_completionHandler(&usb_proto, &block);
+            }
         }
         Ok(())
     }
 
     /// Dynamically reconfigures the Virtio-GPU scanout resolution in pixels.
-    /// Uses 2-pixel alignment (preserving exact fullscreen aspect ratio with zero black bars).
-    pub fn reconfigure_display(&self, width: usize, height: usize) {
-        let w = (width & !1).clamp(800, 4096) as f64;
-        let h = (height & !1).clamp(600, 2560) as f64;
+    /// Proportionally scales within Linux `virtio_gpu`'s 4096×4096 ceiling so 5K/6K 16:9
+    /// displays (e.g. 6016×3384) keep their exact 16:9 aspect ratio (4096×2304) with zero side bars.
+    pub fn reconfigure_display_ext(&self, width: usize, height: usize, force_hotplug: bool) {
+        let (even_w, even_h) = fit_guest_pixels(width, height);
+        let w = even_w as f64;
+        let h = even_h as f64;
         unsafe {
             let gpus = self.vm.graphicsDevices();
             if gpus.is_empty() {
@@ -512,7 +610,13 @@ impl VmRunner {
             }
             let display = displays.objectAtIndex(0);
             let current = display.sizeInPixels();
-            if (current.width - w).abs() < 2.0 && (current.height - h).abs() < 2.0 {
+            let same_size = (current.width - w).abs() < 2.0 && (current.height - h).abs() < 2.0;
+            if same_size {
+                if force_hotplug && even_w >= 644 {
+                    // Nudge by 2px and back so Linux virtio-gpu emits a fresh DRM hotplug event
+                    let _ = display.reconfigureWithSizeInPixels_error(CGSize::new(w - 2.0, h));
+                    let _ = display.reconfigureWithSizeInPixels_error(CGSize::new(w, h));
+                }
                 return;
             }
             let _ = display.reconfigureWithSizeInPixels_error(CGSize::new(w, h));
@@ -583,6 +687,36 @@ impl VmRunner {
 
 impl Drop for VmRunner {
     fn drop(&mut self) {
+        self.sleep_inhibitor.borrow_mut().release();
+        if let Some(t) = self.balloon_restore_timer.borrow_mut().take() {
+            t.invalidate();
+        }
         self.serial.shutdown();
+    }
+}
+
+/// Proportionally fits `(width, height)` inside Linux `virtio_gpu`'s `4096×4096` DRM max
+/// with 2-pixel alignment, preserving the exact screen/window aspect ratio on 4K/5K/6K monitors.
+pub fn fit_guest_pixels(width: usize, height: usize) -> (usize, usize) {
+    const MAX_DIM: f64 = 4096.0;
+    let w = width.max(640) as f64;
+    let h = height.max(480) as f64;
+    let scale = (MAX_DIM / w).min(MAX_DIM / h).min(1.0);
+    let sw = (((w * scale).round() as usize) & !1).clamp(640, 4096);
+    let sh = (((h * scale).round() as usize) & !1).clamp(480, 4096);
+    (sw, sh)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_guest_pixels_preserves_6k_16_by_9_aspect_ratio() {
+        // 6016x3384 (Pro Display XDR / 4K scaled 3008x1692 @ 2x) must become 4096x2304 (exact 16:9),
+        // never 4096x2560 (16:10)!
+        assert_eq!(fit_guest_pixels(6016, 3384), (4096, 2304));
+        // MacBook Pro 14" below notch @ 2x (3024x1900) stays untouched
+        assert_eq!(fit_guest_pixels(3024, 1900), (3024, 1900));
     }
 }

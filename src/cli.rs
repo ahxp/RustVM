@@ -190,6 +190,12 @@ pub enum Commands {
         resolution: Option<String>,
     },
 
+    /// Reclaim unused zeroed blocks from a stopped VM's sparse disk image on APFS
+    Compact {
+        /// VM name or ID
+        name: String,
+    },
+
     /// Delete a virtual machine and its disk image
     Delete {
         /// VM name or ID
@@ -376,6 +382,7 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Some(Commands::Iso { name, action }) => {
             let mut cfg = store.load_vm(&name)?;
+            store.ensure_not_running(&cfg.id, &cfg.name)?;
             match action {
                 IsoAction::Attach { path } => {
                     let abs = path.canonicalize().unwrap_or(path);
@@ -418,6 +425,7 @@ pub fn run(cli: Cli) -> Result<()> {
             resolution,
         }) => {
             let mut cfg = store.load_vm(&name)?;
+            store.ensure_not_running(&cfg.id, &cfg.name)?;
             let host = HostSpecs::detect();
             if let Some(c) = cpus {
                 cfg.cpus = c.clamp(1, host.max_vm_cpus());
@@ -507,8 +515,27 @@ pub fn run(cli: Cli) -> Result<()> {
             println!("Updated configuration for '{}'.", cfg.name);
             cmd_info(&store, &cfg)
         }
+        Some(Commands::Compact { name }) => {
+            let cfg = store.load_vm(&name)?;
+            store.ensure_not_running(&cfg.id, &cfg.name)?;
+            let disk_path = store.disk_path(&cfg.id);
+            println!(
+                "Compacting sparse disk for '{}' ({})...",
+                cfg.name,
+                disk_path.display()
+            );
+            let stats = disk::compact_sparse_disk(&disk_path)?;
+            println!(
+                "Done! {} -> {} (reclaimed {} on host SSD).",
+                format_bytes(stats.before_bytes),
+                format_bytes(stats.after_bytes),
+                format_bytes(stats.reclaimed_bytes)
+            );
+            Ok(())
+        }
         Some(Commands::Delete { name, yes }) => {
             let cfg = store.load_vm(&name)?;
+            store.ensure_not_running(&cfg.id, &cfg.name)?;
             if !yes {
                 print!(
                     "Delete virtual machine '{}' and its virtual disk? [y/N]: ",
@@ -610,12 +637,19 @@ fn cmd_list(store: &VmStore) -> Result<()> {
     }
 
     println!(
-        "{:<22} {:<6} {:<9} {:<20} {}",
-        "NAME", "CPUS", "RAM", "DISK (USED / MAX)", "INSTALLER ISO"
+        "{:<20} {:<11} {:<6} {:<8} {:<20} {}",
+        "NAME", "STATUS", "CPUS", "RAM", "DISK (USED / MAX)", "INSTALLER ISO"
     );
-    println!("{}", "-".repeat(86));
+    println!("{}", "-".repeat(94));
     for vm in vms {
         let usage = disk::disk_usage(&store.disk_path(&vm.id));
+        let status_col = if store.running_pid(&vm.id).is_some() {
+            "Running"
+        } else if store.has_saved_state(&vm.id) {
+            "Saved"
+        } else {
+            "Stopped"
+        };
         let disk_col = format!(
             "{} / {} GB",
             format_bytes(usage.actual_bytes),
@@ -628,8 +662,9 @@ fn cmd_list(store: &VmStore) -> Result<()> {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "— (boots disk)".to_string());
         println!(
-            "{:<22} {:<6} {:<9} {:<20} {}",
+            "{:<20} {:<11} {:<6} {:<8} {:<20} {}",
             vm.name,
+            status_col,
             vm.cpus,
             format_memory_mb(vm.memory_mb),
             disk_col,
@@ -641,20 +676,28 @@ fn cmd_list(store: &VmStore) -> Result<()> {
 
 fn cmd_info(store: &VmStore, cfg: &VmConfig) -> Result<()> {
     let usage = disk::disk_usage(&store.disk_path(&cfg.id));
+    let host = HostSpecs::detect();
     println!("Virtual Machine : {} (id: {})", cfg.name, cfg.id);
+    let live_status = if let Some(pid) = store.running_pid(&cfg.id) {
+        if pid > 0 {
+            format!("Running (PID {pid})")
+        } else {
+            "Running".to_string()
+        }
+    } else if store.has_saved_state(&cfg.id) {
+        "Saved (instant resume ready)".to_string()
+    } else {
+        "Stopped".to_string()
+    };
+    println!("Status          : {live_status}");
     println!("OS Preset       : {}", cfg.os_preset.as_deref().unwrap_or("Custom Linux"));
     println!(
-        "Saved State     : {}",
-        if store.has_saved_state(&cfg.id) {
-            "Ready (instant resume)"
-        } else {
-            "None"
-        }
-    );
-    println!(
-        "CPUs            : {} vCPUs{}",
+        "CPUs            : {} vCPUs{} (Host: {}P + {}E, optimal desktop ceiling: {} vCPUs)",
         cfg.cpus,
-        if cfg.enable_nested_virt { " (Nested KVM enabled)" } else { "" }
+        if cfg.enable_nested_virt { " (Nested KVM enabled)" } else { "" },
+        host.perf_cores,
+        host.eff_cores,
+        host.optimal_desktop_cpus()
     );
     println!(
         "Memory          : {} (Auto-Reclaim={})",

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::catalog::{OsPreset, preset_iso_path};
-use crate::config::VmStore;
+use crate::config::{VmStore, format_bytes};
+use crate::disk;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadProgress {
@@ -48,48 +49,93 @@ where
     }
 
     let tmp_path = dest.with_extension("iso.part");
-    let _ = fs::remove_file(&tmp_path);
+    let resume_from = fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0);
 
+    // 30-second per-read timeout prevents infinite hangs if Wi-Fi drops mid-download
     let agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(20)))
-        .timeout_recv_body(None)
-        .user_agent("RustVM/1.1.3")
+        .timeout_recv_response(Some(Duration::from_secs(30)))
+        .timeout_per_read(Some(Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .user_agent("RustVM/1.2.1")
         .build()
         .new_agent();
 
-    let mut response = agent
-        .get(url)
-        .call()
-        .with_context(|| format!("Failed to download {url}"))?;
+    let mut req = agent.get(url);
+    if resume_from > 0 {
+        req = req.header("Range", &format!("bytes={resume_from}-"));
+    }
 
-    let total_bytes = response
+    let mut response = req
+        .call()
+        .with_context(|| format!("Failed to connect to {url}"))?;
+
+    let mut status = response.status().as_u16();
+    if status == 416 && resume_from > 0 {
+        // Stale or complete .iso.part — restart fresh
+        let _ = fs::remove_file(&tmp_path);
+        response = agent
+            .get(url)
+            .call()
+            .with_context(|| format!("Failed to download {url}"))?;
+        status = response.status().as_u16();
+    }
+
+    if status >= 400 {
+        bail!("HTTP {status} when downloading {url}");
+    }
+
+    let content_len = response
         .headers()
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
-    let mut reader = response.body_mut().as_reader();
-    let mut file = File::create(&tmp_path)
-        .with_context(|| format!("Failed to create temp file {}", tmp_path.display()))?;
+    let (mut file, mut downloaded, total_bytes) = if status == 206 && resume_from > 0 {
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&tmp_path)
+            .with_context(|| format!("Failed to open partial download {}", tmp_path.display()))?;
+        (f, resume_from, content_len.map(|rem| resume_from + rem))
+    } else {
+        let f = File::create(&tmp_path)
+            .with_context(|| format!("Failed to create temp file {}", tmp_path.display()))?;
+        (f, 0u64, content_len)
+    };
 
+    // Preflight host disk space check for remaining bytes
+    if let (Some(total), Some(avail)) = (total_bytes, disk::available_space_bytes(&tmp_path)) {
+        let remaining = total.saturating_sub(downloaded);
+        if avail < remaining.saturating_add(128 * 1024 * 1024) {
+            bail!(
+                "Not enough free disk space to download ISO ({} free, {} needed).",
+                format_bytes(avail),
+                format_bytes(remaining)
+            );
+        }
+    }
+
+    let mut reader = response.body_mut().as_reader();
     let mut buf = vec![0u8; 256 * 1024];
-    let mut downloaded: u64 = 0;
+    let session_start_bytes = downloaded;
     let started = Instant::now();
     let mut last_report = Instant::now();
 
     on_progress(DownloadProgress {
-        downloaded_bytes: 0,
+        downloaded_bytes: downloaded,
         total_bytes,
         bytes_per_sec: 0.0,
     });
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            drop(file);
-            let _ = fs::remove_file(&tmp_path);
-            bail!("Download cancelled");
+            let _ = file.flush();
+            bail!("Download cancelled (partial progress saved — click Download again to resume)");
         }
-        let n = reader.read(&mut buf).context("Error reading download stream")?;
+        let n = reader
+            .read(&mut buf)
+            .context("Download stream interrupted or timed out — click Download again to resume")?;
         if n == 0 {
             break;
         }
@@ -99,10 +145,11 @@ where
 
         if last_report.elapsed() >= Duration::from_millis(120) {
             let elapsed = started.elapsed().as_secs_f64().max(0.001);
+            let session_bytes = downloaded.saturating_sub(session_start_bytes);
             on_progress(DownloadProgress {
                 downloaded_bytes: downloaded,
                 total_bytes,
-                bytes_per_sec: downloaded as f64 / elapsed,
+                bytes_per_sec: session_bytes as f64 / elapsed,
             });
             last_report = Instant::now();
         }
@@ -113,9 +160,10 @@ where
 
     if let Some(expected) = total_bytes {
         if downloaded < expected {
-            let _ = fs::remove_file(&tmp_path);
             bail!(
-                "Incomplete download: received {downloaded} bytes of {expected} expected"
+                "Incomplete download ({} of {} received) — click Download again to resume",
+                format_bytes(downloaded),
+                format_bytes(expected)
             );
         }
     }
@@ -129,10 +177,11 @@ where
     })?;
 
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let session_bytes = downloaded.saturating_sub(session_start_bytes);
     on_progress(DownloadProgress {
         downloaded_bytes: downloaded,
         total_bytes: total_bytes.or(Some(downloaded)),
-        bytes_per_sec: downloaded as f64 / elapsed,
+        bytes_per_sec: session_bytes as f64 / elapsed,
     });
 
     Ok(())
