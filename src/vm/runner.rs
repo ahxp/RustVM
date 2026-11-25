@@ -9,7 +9,7 @@ use objc2_virtualization::{
     VZUSBMassStorageDevice, VZVirtioTraditionalMemoryBalloonDevice, VZVirtualMachine,
     VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -17,6 +17,7 @@ use std::rc::Rc;
 use crate::config::{VmConfig, VmStore};
 use crate::vm::config_builder::{build_usb_iso_config, build_vz_configuration, file_url};
 use crate::vm::console::SerialBridge;
+use crate::vm::power::SleepInhibitor;
 use crate::vm::{VmEvent, VmState, is_virtualization_supported};
 use std::fs;
 
@@ -62,6 +63,9 @@ pub struct VmRunner {
     configured_memory_bytes: u64,
     save_restore_support: Result<(), String>,
     balloon_restore_timer: RefCell<Option<Retained<NSTimer>>>,
+    sleep_inhibitor: Rc<RefCell<SleepInhibitor>>,
+    prevent_sleep: Rc<Cell<bool>>,
+    sleep_reason: String,
 }
 
 impl VmRunner {
@@ -81,8 +85,38 @@ impl VmRunner {
         }
 
         let vz_config = build_vz_configuration(store, cfg, &serial, headless)?;
-        let on_event: EventCallback = Rc::new(RefCell::new(Box::new(on_event)));
-        let delegate = RustVmDelegate::new(Rc::clone(&on_event));
+        let sleep_inhibitor = Rc::new(RefCell::new(SleepInhibitor::new()));
+        let prevent_sleep = Rc::new(Cell::new(cfg.prevent_sleep));
+        let sleep_reason = format!("RustVM: {} is running", cfg.name);
+
+        let inh_ev = Rc::clone(&sleep_inhibitor);
+        let prev_ev = Rc::clone(&prevent_sleep);
+        let reason_ev = sleep_reason.clone();
+        let mut user_cb = on_event;
+        let wrapped_cb: EventCallback = Rc::new(RefCell::new(Box::new(move |event: VmEvent| {
+            match &event {
+                VmEvent::StateChanged(VmState::Running) => {
+                    if prev_ev.get() {
+                        inh_ev.borrow_mut().acquire(&reason_ev);
+                    }
+                }
+                VmEvent::StateChanged(
+                    VmState::Paused
+                    | VmState::Stopped
+                    | VmState::Error
+                    | VmState::Saving
+                    | VmState::Stopping,
+                )
+                | VmEvent::GuestStopped
+                | VmEvent::StoppedWithError(_) => {
+                    inh_ev.borrow_mut().release();
+                }
+                _ => {}
+            }
+            (user_cb)(event);
+        })));
+
+        let delegate = RustVmDelegate::new(Rc::clone(&wrapped_cb));
 
         let configured_memory_bytes = unsafe { vz_config.memorySize() };
         let save_restore_support = unsafe {
@@ -104,10 +138,13 @@ impl VmRunner {
             vm,
             _delegate: delegate,
             serial,
-            on_event,
+            on_event: wrapped_cb,
             configured_memory_bytes,
             save_restore_support,
             balloon_restore_timer: RefCell::new(None),
+            sleep_inhibitor,
+            prevent_sleep,
+            sleep_reason,
         })
     }
 
@@ -525,7 +562,18 @@ impl VmRunner {
         }
     }
 
+    /// Live-toggles macOS display & system sleep prevention while the VM is running.
+    pub fn set_prevent_sleep(&self, enabled: bool) {
+        self.prevent_sleep.set(enabled);
+        if enabled && self.state() == VmState::Running {
+            self.sleep_inhibitor.borrow_mut().acquire(&self.sleep_reason);
+        } else {
+            self.sleep_inhibitor.borrow_mut().release();
+        }
+    }
+
     pub fn shutdown_serial(&mut self) {
+        self.sleep_inhibitor.borrow_mut().release();
         if let Some(t) = self.balloon_restore_timer.borrow_mut().take() {
             t.invalidate();
         }

@@ -53,7 +53,7 @@ impl VmWizardWindow {
 
         let is_edit = matches!(mode, WizardMode::Edit(_));
         let w = 576.0;
-        let h = if is_edit { 640.0 } else { 686.0 };
+        let h = if is_edit { 664.0 } else { 710.0 };
 
         let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
         let window = unsafe {
@@ -93,6 +93,7 @@ impl VmWizardWindow {
             init_nested,
             init_disk_mode,
             init_auto_reclaim,
+            init_prevent_sleep,
             init_scale,
             editing_cfg,
         ) = match mode {
@@ -129,6 +130,7 @@ impl VmWizardWindow {
                     false,
                     DiskIoMode::Fastest,
                     true,
+                    true,
                     DisplayScale::Crisp15x,
                     None,
                 )
@@ -155,6 +157,7 @@ impl VmWizardWindow {
                     cfg.enable_nested_virt,
                     cfg.disk_io_mode,
                     cfg.auto_reclaim_ram,
+                    cfg.prevent_sleep,
                     eff_scale,
                     Some(cfg),
                 )
@@ -173,6 +176,7 @@ impl VmWizardWindow {
         let nested_val = Rc::new(Cell::new(init_nested));
         let disk_mode_val = Rc::new(Cell::new(init_disk_mode));
         let auto_reclaim_val = Rc::new(Cell::new(init_auto_reclaim));
+        let prevent_sleep_val = Rc::new(Cell::new(init_prevent_sleep));
         let scale_val = Rc::new(Cell::new(init_scale));
         let start_now_val = Rc::new(Cell::new(true));
         let preset_idx_val = Rc::new(Cell::new(init_preset_idx));
@@ -524,6 +528,19 @@ impl VmWizardWindow {
 
         // 7. Performance & Hardware Feature Checkboxes
         {
+            let psv = Rc::clone(&prevent_sleep_val);
+            let cb = widgets::checkbox(
+                mtm,
+                rect(ctrl_x, y, ctrl_w, 20.0),
+                "Keep Mac & screen awake while VM is running",
+                init_prevent_sleep,
+                &mut targets,
+                move |b| psv.set(b),
+            );
+            root.addSubview(&cb);
+        }
+        y += 24.0;
+        {
             let arv = Rc::clone(&auto_reclaim_val);
             let cb = widgets::checkbox(
                 mtm,
@@ -682,6 +699,7 @@ impl VmWizardWindow {
                     cfg.enable_nested_virt = nested_val.get();
                     cfg.disk_io_mode = disk_mode_val.get();
                     cfg.auto_reclaim_ram = auto_reclaim_val.get();
+                    cfg.prevent_sleep = prevent_sleep_val.get();
                     let sc = scale_val.get();
                     cfg.display_scale = Some(sc);
                     cfg.hidpi_display = sc == DisplayScale::Retina2x;
@@ -719,6 +737,7 @@ impl VmWizardWindow {
                             cfg.enable_nested_virt = nested_val.get();
                             cfg.disk_io_mode = disk_mode_val.get();
                             cfg.auto_reclaim_ram = auto_reclaim_val.get();
+                            cfg.prevent_sleep = prevent_sleep_val.get();
                             let sc = scale_val.get();
                             cfg.display_scale = Some(sc);
                             cfg.hidpi_display = sc == DisplayScale::Retina2x;

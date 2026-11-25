@@ -176,6 +176,9 @@ pub enum Commands {
         /// Enable or disable automatic idle RAM reclaim when minimized/inactive
         #[arg(long)]
         auto_reclaim: Option<bool>,
+        /// Prevent macOS from sleeping or turning off screen while VM is running
+        #[arg(long)]
+        prevent_sleep: Option<bool>,
         /// Enable or disable nested virtualization (KVM/Docker on M3/M4 Macs)
         #[arg(long)]
         nested_virt: Option<bool>,
@@ -409,6 +412,7 @@ pub fn run(cli: Cli) -> Result<()> {
             hidpi,
             disk_mode,
             auto_reclaim,
+            prevent_sleep,
             nested_virt,
             discard_state,
             resolution,
@@ -476,6 +480,9 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             if let Some(ar) = auto_reclaim {
                 cfg.auto_reclaim_ram = ar;
+            }
+            if let Some(ps) = prevent_sleep {
+                cfg.prevent_sleep = ps;
             }
             if let Some(nv) = nested_virt {
                 cfg.enable_nested_virt = nv;
@@ -669,6 +676,14 @@ fn cmd_info(store: &VmStore, cfg: &VmConfig) -> Result<()> {
         cfg.effective_display_scale().label()
     );
     println!("Disk I/O Mode   : {}", cfg.disk_io_mode.label());
+    println!(
+        "Keep Awake      : {}",
+        if cfg.prevent_sleep {
+            "On (prevents Mac & display sleep while running)"
+        } else {
+            "Off"
+        }
+    );
     println!("Network         : NAT (MAC {})", cfg.mac_address);
     println!(
         "Installer ISO   : {}",

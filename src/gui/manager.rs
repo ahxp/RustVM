@@ -746,8 +746,11 @@ impl ManagerApp {
             &hw_view,
             336.0,
             96.0,
-            "Network",
-            &format!("NAT ({})", vm.mac_address),
+            "Power / Net",
+            &format!(
+                "{} · NAT",
+                if vm.prevent_sleep { "Keep Awake" } else { "Normal Sleep" }
+            ),
         );
         self.detail_container.addSubview(&hw_box);
         y += 140.0;

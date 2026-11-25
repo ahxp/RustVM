@@ -213,6 +213,7 @@ struct DisplayControls {
     can_save_state: Cell<bool>,
     shared_folder: Option<PathBuf>,
     display_scale: Cell<DisplayScale>,
+    prevent_sleep: Cell<bool>,
     active_pixels: Cell<(usize, usize)>,
     in_fullscreen: Cell<bool>,
     current_iso: RefCell<Option<PathBuf>>,
@@ -355,17 +356,23 @@ impl DisplayControls {
             pw,
             ph
         );
+        let awake_desc = if self.prevent_sleep.get() {
+            " · Keep Awake"
+        } else {
+            ""
+        };
         let share_desc = if self.shared_folder.is_some() {
             " · Shared: virtiofs"
         } else {
             ""
         };
         self.footer_label.setStringValue(&NSString::from_str(&format!(
-            "{} vCPUs · {} · {} · {} · NAT · {}{}",
+            "{} vCPUs · {} · {} · {} · NAT{} · {}{}",
             self.vm_cpus,
             format_memory_mb(self.vm_memory_mb),
             display_desc,
             self.disk_io_mode.short_label(),
+            awake_desc,
             iso_desc,
             share_desc
         )));
@@ -446,7 +453,7 @@ impl VmDisplaySession {
         }
         window.setCollectionBehavior(NSWindowCollectionBehavior::FullScreenPrimary);
         window.setBackgroundColor(Some(&NSColor::blackColor()));
-        window.setMinSize(size(980.0, 560.0));
+        window.setMinSize(size(1068.0, 560.0));
         window.setTitle(&NSString::from_str(&format!(
             "RustVM — {} [Starting…]",
             cfg.name
@@ -599,7 +606,7 @@ impl VmDisplaySession {
         let vm_view_for_keys = vm_view.clone();
         let keys_cb = widgets::checkbox(
             mtm,
-            rect(848.0, 13.0, 108.0, 20.0),
+            rect(846.0, 13.0, 102.0, 20.0),
             "Capture Keys",
             true,
             &mut targets,
@@ -607,6 +614,18 @@ impl VmDisplaySession {
                 vm_view_for_keys.setCapturesSystemKeys(checked);
             },
         );
+
+        let awake_cb = widgets::checkbox(
+            mtm,
+            rect(954.0, 13.0, 98.0, 20.0),
+            "Keep Awake",
+            cfg.prevent_sleep,
+            &mut targets,
+            |_| {},
+        );
+        awake_cb.setToolTip(Some(&NSString::from_str(
+            "Prevent macOS from sleeping or turning off the display while this VM is running",
+        )));
 
         toolbar.addSubview(&pause_btn);
         toolbar.addSubview(&save_btn);
@@ -618,6 +637,7 @@ impl VmDisplaySession {
         toolbar.addSubview(&scale_popup);
         toolbar.addSubview(&fs_btn);
         toolbar.addSubview(&keys_cb);
+        toolbar.addSubview(&awake_cb);
 
         window.setContentView(Some(&root));
 
@@ -649,6 +669,7 @@ impl VmDisplaySession {
             can_save_state: Cell::new(false),
             shared_folder: cfg.shared_folder.clone(),
             display_scale: Cell::new(initial_scale),
+            prevent_sleep: Cell::new(cfg.prevent_sleep),
             active_pixels: Cell::new((boot_px_w, boot_px_h)),
             in_fullscreen: Cell::new(false),
             current_iso: RefCell::new(cfg.iso_path.clone()),
@@ -906,6 +927,24 @@ impl VmDisplaySession {
                     if let Ok(mut saved) = st.load_vm(&vm_id_scale) {
                         saved.display_scale = Some(scale);
                         saved.hidpi_display = scale == DisplayScale::Retina2x;
+                        let _ = st.save_vm(&saved);
+                    }
+                }
+            });
+        }
+        {
+            let r = Rc::clone(&runner);
+            let c = Rc::clone(&controls);
+            let vm_id_awake = cfg.id.clone();
+            targets.bind(mtm, &awake_cb, move |sender| {
+                let state: isize = unsafe { msg_send![sender, state] };
+                let enabled = state == objc2_app_kit::NSControlStateValueOn;
+                c.prevent_sleep.set(enabled);
+                r.borrow().set_prevent_sleep(enabled);
+                c.refresh_iso_and_footer();
+                if let Ok(st) = VmStore::open_default() {
+                    if let Ok(mut saved) = st.load_vm(&vm_id_awake) {
+                        saved.prevent_sleep = enabled;
                         let _ = st.save_vm(&saved);
                     }
                 }

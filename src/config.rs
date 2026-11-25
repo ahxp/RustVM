@@ -131,6 +131,8 @@ pub struct VmConfig {
     pub disk_io_mode: DiskIoMode,
     #[serde(default = "default_true")]
     pub auto_reclaim_ram: bool,
+    #[serde(default = "default_true")]
+    pub prevent_sleep: bool,
     #[serde(default)]
     pub iso_path: Option<PathBuf>,
     #[serde(default)]
@@ -446,6 +448,7 @@ impl VmStore {
             display_scale: Some(DisplayScale::Crisp15x),
             disk_io_mode: DiskIoMode::Fastest,
             auto_reclaim_ram: true,
+            prevent_sleep: true,
             iso_path: req.iso_path,
             shared_folder: req.shared_folder,
             shared_folder_readonly: false,

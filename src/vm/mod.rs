@@ -1,5 +1,6 @@
 pub mod config_builder;
 pub mod console;
+pub mod power;
 pub mod runner;
 
 use std::path::PathBuf;
