@@ -534,7 +534,7 @@ impl ManagerApp {
         let mut targets = self.sidebar_targets.borrow_mut();
         let mut y = 6.0;
         let row_h = 56.0;
-        let row_w = 224.0;
+        let row_w = 216.0;
 
         for vm in vms {
             let is_sel = selected.as_deref() == Some(vm.id.as_str());
@@ -894,18 +894,19 @@ impl ManagerApp {
         st_view.addSubview(&widgets::semibold_label(mtm, rect(16.0, 12.0, 320.0, 18.0), "STORAGE & INSTALLER ISO", 11.5));
         st_view.addSubview(&widgets::separator(mtm, rect(16.0, 34.0, content_w - 32.0, 1.0)));
 
-        add_kv_row(
+        let disk_k = widgets::secondary_label(mtm, rect(16.0, 44.0, 92.0, 18.0), "Virtual Disk", 12.0);
+        let disk_v = widgets::label(
             mtm,
-            &st_view,
-            16.0,
-            44.0,
-            "Virtual Disk",
+            rect(112.0, 44.0, content_w - 256.0, 18.0),
             &format!(
                 "{} GB sparse ({} used on host)",
                 vm.disk_gb,
                 format_bytes(usage.actual_bytes)
             ),
+            12.5,
         );
+        st_view.addSubview(&disk_k);
+        st_view.addSubview(&disk_v);
         {
             let weak = Rc::downgrade(self);
             let id = vm.id.clone();

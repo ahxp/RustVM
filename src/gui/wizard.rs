@@ -572,7 +572,7 @@ impl VmWizardWindow {
             let av = Rc::clone(&audio_val);
             let cb = widgets::checkbox(
                 mtm,
-                rect(ctrl_x, y, 195.0, 20.0),
+                rect(ctrl_x, y, 214.0, 20.0),
                 "Speaker Audio (Virtio Sound)",
                 init_audio,
                 &mut targets,
@@ -583,7 +583,7 @@ impl VmWizardWindow {
             let mv = Rc::clone(&mic_val);
             let mic_cb = widgets::checkbox(
                 mtm,
-                rect(ctrl_x + 204.0, y, ctrl_w - 204.0, 20.0),
+                rect(ctrl_x + 218.0, y, ctrl_w - 218.0, 20.0),
                 "Microphone Input (opt-in)",
                 init_mic,
                 &mut targets,

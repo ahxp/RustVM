@@ -4,6 +4,27 @@ A simple, fast, VirtualBox-style Linux virtual machine manager written in **100%
 
 **Zero external dependencies** — no QEMU, no VirtualBox, no Homebrew required.
 
+## Screenshots
+
+### Virtual Machine Manager
+![RustVM Manager](assets/screenshots/01-manager.png)
+
+### One-Click Official ARM64 Linux Downloader & VM Settings
+<table>
+  <tr>
+    <td align="center" width="54%">
+      <img src="assets/screenshots/02-downloader.png" alt="RustVM Official ARM64 Linux Downloader" />
+      <br />
+      <sub><b>Built-in Official ARM64 Linux Downloader</b></sub>
+    </td>
+    <td align="center" width="46%">
+      <img src="assets/screenshots/03-settings.png" alt="RustVM Virtual Machine Settings" />
+      <br />
+      <sub><b>Hardware, HiDPI, Disk I/O, Nested KVM & Rosetta Settings</b></sub>
+    </td>
+  </tr>
+</table>
+
 ## Highlights
 
 - **VirtualBox-style Native macOS GUI**: Manage multiple Linux VMs, inspect hardware/storage, monitor live status, and run graphical Linux desktops in resizable native display windows (`VZVirtualMachineView` with Virtio-GPU auto-resize).
